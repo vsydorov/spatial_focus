@@ -1,0 +1,12 @@
+*.pyc
+*.swp
+OAR.*
+*.cprof
+*.lprof
+*.mypy_cache
+*.pyc
+*.swp
+*.swo
+*.o
+*.so
+__pycache__
