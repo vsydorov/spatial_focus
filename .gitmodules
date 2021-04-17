@@ -1,0 +1,3 @@
+[submodule "vst"]
+	path = vst
+	url = https://github.com/vsydorov/vst
