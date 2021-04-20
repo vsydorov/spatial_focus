@@ -562,3 +562,159 @@ class Batcher_eval_attentioncrop(object):
                 log.debug('Execute time {}/{} - {time}'.format(
                     i, len(boxdict_loader), time=twrap.time_str))
         return output_items
+
+
+class Batcher_train_rescaled_attentioncrop(object):
+    nswrap: Networks_wrap
+    data_access: DataAccess_Train
+
+    def __init__(
+            self, nswrap, data_access, batch_size, num_workers):
+        self.nswrap = nswrap
+        self.data_access = data_access
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        self.ewrap = TrainEpochWrap()
+
+    def execute_epoch(self, batches_of_vids, folder, epoch) -> None:
+        isaver = Isaver_midepoch_train(folder, batches_of_vids,
+                self.nswrap.model, self.nswrap.optimizer,
+                self.train_on_vids, '0::1')
+        isaver.run()
+
+    def train_on_vids(self, i_meta, batch_of_vids) -> None:
+        time_period = '::10'
+        twrap = TimersWrap(['data', 'gpu'])
+        twrap.tic('data')
+
+        tdataset = TDataset_over_DataAccess(
+                self.data_access, batch_of_vids)
+        loader = torch.utils.data.DataLoader(
+            tdataset, batch_size=self.batch_size,
+            collate_fn=self.data_access.collate_batch,
+            shuffle=False, drop_last=True,
+            num_workers=self.num_workers,
+            pin_memory=True)
+
+        for i, train_item in enumerate(loader):
+            twrap.toc('data'); twrap.tic('gpu')
+            gradient, boxes = self.nswrap.get_attention_gradient_v2(
+                    train_item['X'], train_item['target'])
+            X_f32_unnorm = train_item['X'].type(torch.FloatTensor)
+            # Extract box, rescale to 224x224
+            eboxes224_ = []
+            for i_box, box in enumerate(boxes):
+                l_, t_, r_, d_ = box
+                ebox = X_f32_unnorm[i_box, :, l_:r_, t_:d_, :]
+                ebox_prm = ebox.permute(0, 3, 1, 2)
+                ebox224_prm = torch.nn.functional.interpolate(ebox_prm,
+                        (224, 224),
+                        mode='bilinear', align_corners=True)
+                ebox224 = ebox224_prm.permute(0, 2, 3, 1)
+                eboxes224_.append(ebox224)
+            eboxes224 = torch.stack(eboxes224_)
+
+            del X_f32_unnorm
+
+            output_ups, loss, target_ups = \
+                self.nswrap.forward_model_for_training(
+                    train_item['X'], eboxes224, train_item['target'])
+
+            self.ewrap.update(loss, output_ups, target_ups)
+            loss.backward()
+            self.nswrap.optimizer.step()
+            self.nswrap.optimizer.zero_grad()
+            twrap.toc('gpu'); twrap.tic('data')
+
+            # if self.debug_enabled:
+            #     dfold = vst.mkdir(self._hacky_folder/'debug')
+            #     half = stacked_f32c.shape[1]//2
+            #     input_denorm_ups_bgr = np.flip(upscale_u8(
+            #             np_denormalize(stacked_f32c.cpu().numpy())), axis=-1)
+            #     bigger = input_denorm_ups_bgr[:, :half]
+            #     smaller = input_denorm_ups_bgr[:, half:]
+            #     concat = np.concatenate((bigger, smaller), axis=3)
+            #     for j, v in enumerate(concat):
+            #         quick_video_save(
+            #             dfold/'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(
+            #                 i_meta, i, j), v)
+
+
+class Batcher_eval_rescaled_attentioncrop(object):
+    nswrap: Networks_wrap
+    data_access: DataAccess_Eval
+
+    def __init__(
+            self, nswrap, data_access, batch_size, num_workers):
+        self.nswrap = nswrap
+        self.data_access = data_access
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def execute_epoch(self, batches_of_vids, folder, epoch):
+        isaver = Isaver_midepoch_eval(folder, batches_of_vids,
+                self.eval_on_vids, '0::1')
+        output_items = isaver.run()
+        return output_items
+
+    def eval_on_vids(self, i_meta, batch_of_vids) -> Dict:
+        time_period = '::10'
+        twrap = TimersWrap(['data', 'gpu_prepare', 'gpu'])
+        twrap.tic('data')
+        output_items = {}
+
+        # _get_dict_1_eval_dataloader_v2
+        tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
+        loader = torch.utils.data.DataLoader(
+            tdataset, batch_size=1,
+            collate_fn=self.data_access.collate_batch,
+            shuffle=False, num_workers=self.num_workers, pin_memory=True)
+
+        for i, eval_item in enumerate(loader):
+            twrap.toc('data'); twrap.tic('gpu')
+
+            gradient, boxes = self.nswrap.get_attention_gradient_v2(
+                    eval_item['X'], eval_item['stacked_targets'])
+
+            X_f32_unnorm = eval_item['X'].type(torch.FloatTensor)
+            # Extract box, rescale to 224x224
+            eboxes224_ = []
+            for i, box in enumerate(boxes):
+                l_, t_, r_, d_ = box
+                ebox = X_f32_unnorm[i, :, l_:r_, t_:d_, :]
+                ebox_prm = ebox.permute(0, 3, 1, 2)
+                ebox224_prm = torch.nn.functional.interpolate(ebox_prm,
+                        (224, 224),
+                        mode='bilinear', align_corners=True)
+                ebox224 = ebox224_prm.permute(0, 2, 3, 1)
+                eboxes224_.append(ebox224)
+            eboxes224 = torch.stack(eboxes224_)
+
+            del X_f32_unnorm
+
+            output_item = self.nswrap.forward_model_for_eval_cpu(
+                    eval_item['X'], eboxes224,
+                    eval_item['stacked_targets'], self.batch_size)
+            vid = eval_item['meta'].vid
+            output_items[vid] = output_item
+
+            twrap.toc('gpu'); twrap.tic('data')
+            if vst.check_step(i, time_period):
+                log.debug('Execute time {}/{} - {time}'.format(
+                    i, len(loader), time=twrap.time_str))
+            #
+            # if self.debug_enabled:
+            #     dfold = vst.mkdir(self._hacky_folder/'debug')
+            #     half = stacked_f32c.shape[1]//2
+            #     input_denorm_ups_bgr = np.flip(upscale_u8(
+            #             np_denormalize(stacked_f32c.cpu().numpy())), axis=-1)
+            #     bigger = input_denorm_ups_bgr[:, :half]
+            #     smaller = input_denorm_ups_bgr[:, half:]
+            #     concat = np.concatenate((bigger, smaller), axis=3)
+            #     for j, v in enumerate(concat):
+            #         quick_video_save(
+            #             dfold/'eval_vis_M{:03d}_Iunk_J{:03d}_execute'.format(
+            #                 i, j), v)
+
+        return output_items

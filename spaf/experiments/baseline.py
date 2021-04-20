@@ -26,8 +26,8 @@ from spaf.data_access import (
         DataAccess_plus_transformed_eval)
 from spaf.batcher import (
         Batcher_train_basic, Batcher_eval_basic,
-        Batcher_train_attentioncrop,
-        Batcher_eval_attentioncrop
+        Batcher_train_attentioncrop, Batcher_eval_attentioncrop,
+        Batcher_train_rescaled_attentioncrop, Batcher_eval_rescaled_attentioncrop
         )
 from spaf.trainer import (Trainer)
 from spaf.utils import (enforce_all_seeds, set_env, get_period_actions)
@@ -361,7 +361,26 @@ def train_baseline(workfolder, cfg_dict, add_args):
                 nswrap, data_access_train, train_batch_size, num_workers)
         batcher_eval = Batcher_eval_attentioncrop(
                 nswrap, data_access_eval, eval_batch_size, num_workers)
-
+    elif experiment_name in ['rescaled_attentioncrop',
+            'rescaled_attentioncrop_twonet']:
+        data_access_train = DataAccess_Train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True)
+        data_access_eval = DataAccess_Eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True, eval_gap)
+        if experiment_name == 'rescaled_attentioncrop':
+            nswrap = Networks_wrap_stacked(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+        elif experiment_name == 'rescaled_attentioncrop_twonet':
+            assert cf['twonet.original_net_kind'] == 'fixed_old'
+            nswrap = Networks_wrap_twonet(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind,
+                    cf['twonet.fixed_net_path'])
+        batcher_train = Batcher_train_rescaled_attentioncrop(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_rescaled_attentioncrop(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
     else:
         raise NotImplementedError()
 
