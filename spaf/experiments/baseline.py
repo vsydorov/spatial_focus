@@ -1,7 +1,9 @@
 import re
 import platform
 import subprocess
+import pprint
 from pathlib import Path
+from typing import (Dict)
 
 import logging
 import pandas as pd
@@ -16,11 +18,19 @@ from spaf import gs_model
 from spaf.data.dataset import (
         charades_read_names, charades_read_video_csv, Dataset_charades)
 from spaf.data.video import (compute_ocv_rstats)
-from spaf.network_wrap import (NWrap)
-from spaf.data_access import (DataAccess_Train, DataAccess_Eval)
-from spaf.batcher import (TrainMetaBatcher_Normal, EvalMetaBatcher_Normal)
+from spaf.network_wrap import (
+        Networks_wrap_single, Networks_wrap_stacked, Networks_wrap_twonet)
+from spaf.data_access import (
+        DataAccess_Train, DataAccess_Eval,
+        DataAccess_plus_transformed_train,
+        DataAccess_plus_transformed_eval)
+from spaf.batcher import (
+        Batcher_train_basic, Batcher_eval_basic,
+        Batcher_train_attentioncrop,
+        Batcher_eval_attentioncrop
+        )
 from spaf.trainer import (Trainer)
-from spaf.utils import (enforce_all_seeds, set_env)
+from spaf.utils import (enforce_all_seeds, set_env, get_period_actions)
 
 log = logging.getLogger(__name__)
 
@@ -72,15 +82,14 @@ torch_data:
     train_gap: 64
     eval_gap: 10
     num_workers: 4
-    video_batch_size: 2
+    video_batch_size: 2  # train batchsize
     eval_batch_size: 5
     train_batcher_size: 200
     eval_batcher_size: 50
     cull:
-        train: [~, ~]
-        val: [~, ~]
-        qeval: [~, ~]
-        test: [~, ~]
+        train: ~
+        eval: ~
+        qeval: ~
 
 attention:
     crop: 128
@@ -88,13 +97,10 @@ attention:
     perframe_reduce: !def ['max', ['max', 'min']]
     batch_attend: False
     new_target: !def ['append', ['single', 'append']]
-"""
 
-
-TWONET_DEFTYPE = """
 twonet:
-    original_net_kind: ['fixed_old', ['fixed_old', 'new']]
-    fixed_net_path: [~, ~]
+    original_net_kind: !def ['fixed_old', ['fixed_old', 'new']]
+    fixed_net_path: ~
 """
 
 def find_checkpoints(rundir):
@@ -128,120 +134,6 @@ def create_optimizer(model, optimizer, lr, momentum, weight_decay):
     return optimizer
 
 
-def _network_preparation(cf, dataset):
-    model_type = cf['model.type']
-
-    if isinstance(dataset, Dataset_charades):
-        nclass = 157
-    # elif cf['dataset.name'] == 'hmdb51':
-    #     nclass = 51
-    else:
-        raise NotImplementedError()
-    model = create_model(model_type, nclass)
-    optimizer = create_optimizer(
-            model,
-            cf['training.optimizer'],
-            cf['training.lr'],
-            cf['training.momentum'],
-            cf['training.weight_decay'])
-    return model, model_type, optimizer
-
-
-def _nwrap_preparation(cf, experiment_name,
-        model, model_type, optimizer):
-
-    lr = cf['training.lr']
-    lr_decay_rate = cf['training.lr_decay_rate']
-    eval_batch_size = cf['torch_data.eval_batch_size']
-
-    if experiment_name in ['normal', 'centercrop', 'randomcrop', 'mirror']:
-        nwrap = NWrap(
-                model, model_type, optimizer,
-                lr, lr_decay_rate, eval_batch_size)
-    elif experiment_name in [
-            'mirror_twonet', 'centercrop_twonet', 'randomcrop_twonet']:
-        nwrap = NWrap_twonet(
-                model, model_type, optimizer,
-                lr, lr_decay_rate, eval_batch_size,
-                original_net_kind=cf['twonet.original_net_kind'],
-                fixed_net_path=cf['twonet.fixed_net_path'])
-        nwrap.load_second_net()
-    elif experiment_name in ['attentioncrop', 'rescaled_attentioncrop']:
-        nwrap = NWrap_Attention(
-                model, model_type, optimizer,
-                lr, lr_decay_rate, eval_batch_size,
-                att_crop=cf['attention.crop'],
-                attention_kind=cf['attention.kind'])
-    elif experiment_name in [
-            'attentioncrop_twonet',
-            'rescaled_attentioncrop_twonet']:
-        nwrap = NWrap_Attention_twonet(
-                model, model_type, optimizer,
-                lr, lr_decay_rate, eval_batch_size,
-                att_crop=cf['attention.crop'],
-                attention_kind=cf['attention.kind'],
-                original_net_kind=cf['twonet.original_net_kind'],
-                fixed_net_path=cf['twonet.fixed_net_path'])
-        nwrap.load_second_net()
-    else:
-        raise NotImplementedError()
-    return nwrap
-
-
-def _data_access_preparation_train_eval(
-        cf, experiment_name, dataset, nwrap):
-    initial_resize = 256
-    input_size = cf['torch_data.input_size']
-    train_gap = cf['torch_data.train_gap']
-    eval_gap = cf['torch_data.eval_gap']
-    fps = cf['video.fps']
-    if experiment_name == 'normal':
-        data_access_train = DataAccess_Train(
-                sa, initial_resize, input_size, train_gap, fps,
-                params_to_meta=False,
-                new_target='single')
-        data_access_eval = DataAccess_Eval(
-                sa, initial_resize, input_size, train_gap, fps,
-                params_to_meta=False,
-                new_target='single',
-                eval_gap=eval_gap)
-        train_batcher_cls = TrainMetaBatcher_Normal
-        eval_batcher_cls = EvalMetaBatcher_Normal
-    else:
-        raise NotImplementedError()
-
-    NORM_MEAN = torch.cuda.FloatTensor([0.485, 0.456, 0.406])
-    NORM_STD = torch.cuda.FloatTensor([0.229, 0.224, 0.225])
-
-    train_batcher_size = cf['torch_data.train_batcher_size']
-    eval_batcher_size = cf['torch_data.eval_batcher_size']
-    debug_enabled = cf['utility.debug']
-    video_batch_size = cf['torch_data.video_batch_size']
-    num_workers = cf['torch_data.num_workers']
-
-    batcher_train = train_batcher_cls(
-            NORM_MEAN, NORM_STD, train_batcher_size, data_access_train,
-            nwrap, video_batch_size, num_workers, debug_enabled)
-
-    batcher_eval = eval_batcher_cls(
-            NORM_MEAN, NORM_STD, eval_batcher_size, data_access_eval,
-            nwrap, video_batch_size, num_workers, debug_enabled)
-
-    return batcher_train, batcher_eval
-
-
-def _set_defaults(cfg, cfg_dict):
-    cfg.set_defaults(DEFAULTS)
-    if cfg_dict['experiment'] in [
-            'mirror_twonet',
-            'centercrop_twonet',
-            'randomcrop_twonet',
-            'attentioncrop_twonet',
-            'rescaled_attentioncrop_twonet'
-            ]:
-        cfg.set_deftype(TWONET_DEFTYPE)
-
-
 def platform_info():
     platform_string = f'Node: {platform.node()}'
     oar_jid = subprocess.run('echo $OAR_JOB_ID', shell=True,
@@ -252,13 +144,59 @@ def platform_info():
     return platform_string
 
 
-def _train_loop(cf, period_specs, trainer, checkpoint_path,
-                train_vids, eval_vids_dict):
+def cull_vids_fraction(vids, fraction):
+    if fraction is None:
+        return vids
+    shuffle = fraction < 0.0
+    fraction = abs(fraction)
+    assert 0.0 <= fraction < 1.0
+    N_total = int(len(vids) * fraction)
+    if shuffle:
+        culled_vids = np.random.permutation(vids)[:N_total]
+    else:
+        culled_vids = vids[:N_total]
+    return culled_vids
+
+
+def prepare_charades_vids_v2(dataset: Dataset_charades, cull_specs):
+    # Prepare vids
+    train_vids = [vid for vid, v in dataset.videos.items()
+            if v['split'] in ['train', 'val']]
+    eval_vids = [vid for vid, v in dataset.videos.items()
+            if v['split'] in ['test']]
+    # Cull if necessary
+    if cull_specs is not None:
+        train_vids = cull_vids_fraction(train_vids, cull_specs['train'])
+        eval_vids = cull_vids_fraction(eval_vids, cull_specs['eval'])
+    # Eval dict
+    eval_vids_dict = {'eval': eval_vids}
+    return train_vids, eval_vids_dict
+
+
+def _assign_actions_to_checkpoints(checkpoints, period_specs):
+    checkpoints_and_actions = {}
+    for epoch, path in checkpoints.items():
+        period_actions = get_period_actions(epoch, period_specs)
+        datanames_to_eval = [
+                k for k in ['qeval', 'eval'] if period_actions[k]]
+        if len(datanames_to_eval):
+            checkpoints_and_actions[epoch] = \
+                [path.name, datanames_to_eval]
+    return checkpoints_and_actions
+
+
+def _train_loop(cf, period_specs, trainer: Trainer,
+        train_vids, eval_vids_dict) -> None:
     # Train loop
-    start_epoch = trainer.restore_model_magic(
+    checkpoints = find_checkpoints(trainer.rundir)
+    if len(checkpoints):
+        checkpoint_path = max(checkpoints.items())[1]
+    else:
+        checkpoint_path = None
+    start_epoch = trainer.nswrap.restore_model_magic(
             checkpoint_path, cf['inputs.model'],
-            cf['training.start_epoch'])
-    vst.additional_logging(trainer.rundir/'TRAIN', f'from_{start_epoch}')
+            cf['training.start_epoch'], cf['model.type'])
+    vst.additional_logging(trainer.rundir/'TRAIN'/f'from_{start_epoch}')
     # print platform info again
     log.info(platform_info())
     trainer.eval_check_after_restore(
@@ -271,6 +209,36 @@ def _train_loop(cf, period_specs, trainer, checkpoint_path,
             cf['utility.train_loop_eval'],
             period_specs)
 
+
+def _eval_loop(period_specs, trainer: Trainer,
+        eval_vids_dict, recheck) -> None:
+    # Execute evaluation procedure inplace
+    vst.additional_logging(trainer.rundir/'EVAL'/'eval')
+    checkpoints: Dict[int, Path] = find_checkpoints(trainer.rundir)
+    checkpoints_and_actions = _assign_actions_to_checkpoints(
+            checkpoints, period_specs)
+    log.info('Actions per checkpoint:\n{}'.format(
+            pprint.pformat(checkpoints_and_actions)))
+    epochs_to_eval = list(checkpoints_and_actions.keys())
+    while len(epochs_to_eval):
+        epoch = epochs_to_eval.pop(0)
+        checkpoint_path = checkpoints[epoch]
+        datanames_to_eval = checkpoints_and_actions[epoch][1]
+        subloop_eval_vids_dict = \
+                {k: eval_vids_dict[k] for k in datanames_to_eval}
+        trainer.nswrap.load_my_checkpoint(checkpoint_path)
+        trainer.evaluation_subloop(epoch, subloop_eval_vids_dict)
+        if recheck:
+            # Recheck for new good checkpoints
+            checkpoints = find_checkpoints(trainer.rundir)
+            checkpoints_and_actions = _assign_actions_to_checkpoints(
+                    checkpoints, period_specs)
+            new_checkpoints = [k for k in checkpoints_and_actions.keys()
+                    if k > max(epochs_to_eval, default=epoch)]
+            if len(new_checkpoints):
+                log.info('New checkpoint found after recheck: {}'.format(
+                    new_checkpoints))
+                epochs_to_eval.extend(new_checkpoints)
 
 # Experiments
 
@@ -286,11 +254,6 @@ def train_baseline(workfolder, cfg_dict, add_args):
 
     enforce_all_seeds(cf['manual_seed'])
     set_env()
-    checkpoints = find_checkpoints(rundir)
-    if len(checkpoints):
-        checkpoint_path = max(checkpoints.items())[1]
-    else:
-        checkpoint_path = None
 
     experiment_name = cf['experiment']
 
@@ -300,20 +263,117 @@ def train_baseline(workfolder, cfg_dict, add_args):
     dataset = vst.load_pkl(cf['inputs.dataset'])
 
     # // Create network
-    model, model_type, optimizer = _network_preparation(cf, dataset)
+    model_type = cf['model.type']
+    if isinstance(dataset, Dataset_charades):
+        nclass = 157
+    else:
+        raise NotImplementedError()
+    model = create_model(model_type, nclass)
+    optimizer = create_optimizer(
+            model,
+            cf['training.optimizer'],
+            cf['training.lr'],
+            cf['training.momentum'],
+            cf['training.weight_decay'])
     # // Create nwrap
-    nwrap = _nwrap_preparation(cf, experiment_name,
-        model, model_type, optimizer)
+    lr = cf['training.lr']
+    lr_decay_rate = cf['training.lr_decay_rate']
+    NORM_MEAN = torch.cuda.FloatTensor([0.485, 0.456, 0.406])
+    NORM_STD = torch.cuda.FloatTensor([0.229, 0.224, 0.225])
+    att_crop = cf['attention.crop']
+    att_kind = cf['attention.kind']
+
     # // Data access
-    batcher_train, batcher_eval = _data_access_preparation_train_eval(
-            cf, experiment_name, dataset, nwrap)
+    # /// Data access params
+    initial_resize = 256
+    input_size = cf['torch_data.input_size']
+    train_gap = cf['torch_data.train_gap']
+    eval_gap = cf['torch_data.eval_gap']
+    fps = cf['video.fps']
+
+    # /// Batcher params
+    size_vidbatch_train = cf['torch_data.train_batcher_size']
+    size_vidbatch_eval = cf['torch_data.eval_batcher_size']
+    debug_enabled = cf['utility.debug']
+    train_batch_size = cf['torch_data.video_batch_size']  # train batchsize
+    eval_batch_size = cf['torch_data.eval_batch_size']   # eval batchsize
+    num_workers = cf['torch_data.num_workers']
+
+    if experiment_name == 'normal':
+        data_access_train = DataAccess_Train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False)
+        data_access_eval = DataAccess_Eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False, eval_gap)
+        nswrap = Networks_wrap_single(model, optimizer,
+                NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+        batcher_train = Batcher_train_basic(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_basic(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+    elif experiment_name in [
+            'mirror', 'mirror_twonet',
+            'centercrop', 'centercrop_twonet',
+            'randomcrop', 'randomcrop_twonet']:
+        # Name preparation
+        en_split = experiment_name.split('_')
+        if len(en_split) == 1:
+            en_split.append('stacked')
+        transform_kind, nw_kind = en_split
+
+        data_access_train = DataAccess_plus_transformed_train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False, transform_kind,
+                cf['attention.crop'])
+        data_access_eval = DataAccess_plus_transformed_eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False, eval_gap, transform_kind,
+                cf['attention.crop'])
+        if nw_kind == 'stacked':
+            nswrap = Networks_wrap_stacked(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+        elif nw_kind == 'twonet':
+            assert cf['twonet.original_net_kind'] == 'fixed_old'
+            nswrap = Networks_wrap_twonet(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate,
+                    cf['twonet.fixed_net_path'])
+        batcher_train = Batcher_train_basic(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_basic(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+    elif experiment_name in ['attentioncrop', 'attentioncrop_twonet']:
+        data_access_train = DataAccess_Train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True)
+        data_access_eval = DataAccess_Eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True, eval_gap)
+        if experiment_name == 'attentioncrop':
+            nswrap = Networks_wrap_stacked(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+        elif experiment_name == 'attentioncrop_twonet':
+            assert cf['twonet.original_net_kind'] == 'fixed_old'
+            nswrap = Networks_wrap_twonet(model, optimizer,
+                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind,
+                    cf['twonet.fixed_net_path'])
+        batcher_train = Batcher_train_attentioncrop(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_attentioncrop(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+
+    else:
+        raise NotImplementedError()
 
     # // Create trainer
-    trainer = Trainer(rundir, nwrap, batcher_train, batcher_eval)
+    trainer = Trainer(rundir, nswrap,
+            batcher_train, batcher_eval,
+            size_vidbatch_train, size_vidbatch_eval)
+
+    train_vids, eval_vids_dict = prepare_charades_vids_v2(dataset, cull_specs)
 
     if '--eval' in add_args:
         recheck = '--recheck' in add_args
-        _eval_loop(period_specs, trainer, rundir, eval_vids_dict, recheck)
+        _eval_loop(period_specs, trainer, eval_vids_dict, recheck)
     else:
-        _train_loop(cf, period_specs, trainer, checkpoint_path,
-                train_vids, eval_vids_dict)
+        _train_loop(cf, period_specs, trainer, train_vids, eval_vids_dict)

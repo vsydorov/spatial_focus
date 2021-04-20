@@ -26,15 +26,6 @@ from spaf.data.dataset import (
 log = logging.getLogger(__name__)
 
 
-class DataAccess(ABC):
-    def __init__(self):
-        super().__init__()
-
-    @abstractmethod
-    def get_item(self, vid: str):
-        raise NotImplementedError()
-
-
 class Train_Transform_Params(TypedDict):
     resize: Any
     rcrop: Any
@@ -149,14 +140,13 @@ def sequence_batch_collate_v2(batch):
     return collated
 
 
-def _get_sequences_batch_train_dataloader_v2(
-        gdataset, batch_size, num_workers, shuffle=True):
-    loader = torch.utils.data.DataLoader(
-        gdataset, batch_size=batch_size,
-        collate_fn=sequence_batch_collate_v2,
-        shuffle=shuffle, drop_last=True,
-        num_workers=num_workers, pin_memory=True, sampler=None)
-    return loader
+class DataAccess(ABC):
+    def __init__(self):
+        super().__init__()
+
+    @abstractmethod
+    def get_item(self, vid: str):
+        raise NotImplementedError()
 
 
 class TDataset_over_DataAccess(torch.utils.data.Dataset):
@@ -186,7 +176,7 @@ class DataAccess_Train(DataAccess):
 
     def __init__(
             self, dataset, initial_resize, input_size,
-            train_gap, fps, params_to_meta, new_target):
+            train_gap, fps, params_to_meta):
         super().__init__()
         self.sampler = Sampler_charades(dataset)
         self.initial_resize = initial_resize
@@ -254,6 +244,18 @@ class DataAccess_Train(DataAccess):
                 meta=meta)
         return train_item
 
+    @staticmethod
+    def collate_batch(batch):
+        X = default_collate([x['X'] for x in batch])
+        if batch[0]['X_plus'] is not None:
+            X_plus = default_collate([x['X_plus'] for x in batch])
+        else:
+            X_plus = None
+        target = default_collate([x['target'] for x in batch])
+        meta = [x['meta'] for x in batch]
+        collated = {'X': X, 'X_plus': X_plus, 'target': target, 'meta': meta}
+        return collated
+
 
 class DataAccess_Eval(DataAccess):
     sampler: Sampler_charades
@@ -262,13 +264,10 @@ class DataAccess_Eval(DataAccess):
     train_gap: int
     fps: int
     params_to_meta: bool
-    new_target: str
     eval_gap: int
 
-    def __init__(self, dataset,
-            initial_resize, input_size,
-            train_gap, fps,
-            params_to_meta, new_target, eval_gap):
+    def __init__(self, dataset, initial_resize, input_size,
+            train_gap, fps, params_to_meta, eval_gap):
         super().__init__()
         self.sampler = Sampler_charades(dataset)
         self.initial_resize = initial_resize
@@ -276,7 +275,6 @@ class DataAccess_Eval(DataAccess):
         self.train_gap = train_gap
         self.fps = fps
         self.params_to_meta = params_to_meta
-        self.new_target = new_target
         self.eval_gap = eval_gap
 
     @staticmethod
@@ -365,6 +363,13 @@ class DataAccess_Eval(DataAccess):
                 meta=meta)
         return eval_item
 
+    @staticmethod
+    def collate_batch(batch):
+        assert len(batch) == 1
+        batch0 = batch[0]
+        assert isinstance(batch0, collections.abc.Mapping)
+        return batch0
+
 
 # Exotic data access variants
 
@@ -408,11 +413,11 @@ class DataAccess_plus_transformed_train(DataAccess_Train):
 
     def __init__(
             self, dataset, initial_resize, input_size,
-            train_gap, fps, params_to_meta, new_target,
+            train_gap, fps, params_to_meta,
             transform_kind, att_crop=None):
         super().__init__(dataset, initial_resize, input_size,
-            train_gap, fps, params_to_meta, new_target)
-        self.transform_kind == transform_kind
+            train_gap, fps, params_to_meta)
+        self.transform_kind = transform_kind
         self.att_crop = att_crop
 
     def get_item(self, vid, shift=None) -> Train_Item:
@@ -457,11 +462,11 @@ class DataAccess_plus_transformed_eval(DataAccess_Eval):
 
     def __init__(
             self, dataset, initial_resize, input_size,
-            train_gap, fps, params_to_meta, new_target, eval_gap,
+            train_gap, fps, params_to_meta, eval_gap,
             transform_kind, att_crop=None):
         super().__init__(dataset, initial_resize, input_size,
-            train_gap, fps, params_to_meta, new_target)
-        self.transform_kind == transform_kind
+            train_gap, fps, params_to_meta, eval_gap)
+        self.transform_kind = transform_kind
         self.att_crop = att_crop
 
     def get_item(self, vid) -> Eval_Item:

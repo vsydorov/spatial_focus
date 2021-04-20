@@ -179,8 +179,8 @@ class Sampler_charades(object):
     def __init__(self, dataset: Dataset_charades):
         self.dataset = dataset
 
-    def get_video(self, vid):
-        video = self.dataset.video[vid]
+    def get_video(self, vid: str) -> Video_charades:
+        video = self.dataset.videos[vid]
         return video
 
     def sample_frameids_and_times(
