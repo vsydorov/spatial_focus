@@ -79,6 +79,7 @@ video:
 torch_data:
     trainval: False
     input_size: 224
+    initial_resize: 256
     train_gap: 64
     eval_gap: 10
     num_workers: 4
@@ -240,6 +241,81 @@ def _eval_loop(period_specs, trainer: Trainer,
                     new_checkpoints))
                 epochs_to_eval.extend(new_checkpoints)
 
+def _get_data_access(cf, dataset, da_kind, plus_transform_kind=None):
+    initial_resize = cf['torch_data.initial_resize']
+    input_size = cf['torch_data.input_size']
+    train_gap = cf['torch_data.train_gap']
+    eval_gap = cf['torch_data.eval_gap']
+    fps = cf['video.fps']
+
+    if da_kind == 'normal':
+        data_access_train = DataAccess_Train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True)
+        data_access_eval = DataAccess_Eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, True, eval_gap)
+    elif da_kind == 'plus':
+        data_access_train = DataAccess_plus_transformed_train(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False, plus_transform_kind,
+                cf['attention.crop'])
+        data_access_eval = DataAccess_plus_transformed_eval(
+                dataset, initial_resize, input_size,
+                train_gap, fps, False, eval_gap, plus_transform_kind,
+                cf['attention.crop'])
+    else:
+        raise RuntimeError()
+    return data_access_train, data_access_eval
+
+def _get_nwswrap(cf, model, optimizer, nsw_kind):
+    lr = cf['training.lr']
+    lr_decay_rate = cf['training.lr_decay_rate']
+    NORM_MEAN = torch.cuda.FloatTensor([0.485, 0.456, 0.406])
+    NORM_STD = torch.cuda.FloatTensor([0.229, 0.224, 0.225])
+    att_crop = cf['attention.crop']
+    att_kind = cf['attention.kind']
+
+    if nsw_kind == 'normal':
+        nswrap = Networks_wrap_single(model, optimizer,
+                NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+    elif nsw_kind == 'stacked':
+        nswrap = Networks_wrap_stacked(model, optimizer,
+                NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
+    elif nsw_kind == 'twonet':
+        assert cf['twonet.original_net_kind'] == 'fixed_old'
+        nswrap = Networks_wrap_twonet(model, optimizer,
+                NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind,
+                cf['twonet.fixed_net_path'])
+    else:
+        raise RuntimeError()
+    return nswrap
+
+def _get_batchers(cf, nswrap, data_access_train, data_access_eval, ba_kind):
+    train_batch_size = cf['torch_data.video_batch_size']  # train batchsize
+    eval_batch_size = cf['torch_data.eval_batch_size']   # eval batchsize
+    num_workers = cf['torch_data.num_workers']
+
+    if ba_kind == 'normal':
+        batcher_train = Batcher_train_basic(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_basic(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+    elif ba_kind == 'attentioncrop':
+        batcher_train = Batcher_train_attentioncrop(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_attentioncrop(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+    elif ba_kind == 'rescaled_attentioncrop':
+        batcher_train = Batcher_train_rescaled_attentioncrop(
+                nswrap, data_access_train, train_batch_size, num_workers)
+        batcher_eval = Batcher_eval_rescaled_attentioncrop(
+                nswrap, data_access_eval, eval_batch_size, num_workers)
+    else:
+        raise RuntimeError()
+    return batcher_train, batcher_eval
+
+
 # Experiments
 
 
@@ -258,133 +334,54 @@ def train_baseline(workfolder, cfg_dict, add_args):
     experiment_name = cf['experiment']
 
     # // Data preparation
-    # data, sa, train_vids, eval_vids_dict = \
-    #         _data_preparation(cf, cull_specs)
     dataset = vst.load_pkl(cf['inputs.dataset'])
-
-    # // Create network
-    model_type = cf['model.type']
     if isinstance(dataset, Dataset_charades):
         nclass = 157
     else:
         raise NotImplementedError()
+
+    # // Create network and optimizer
+    model_type = cf['model.type']
     model = create_model(model_type, nclass)
     optimizer = create_optimizer(
-            model,
-            cf['training.optimizer'],
-            cf['training.lr'],
-            cf['training.momentum'],
-            cf['training.weight_decay'])
-    # // Create nwrap
-    lr = cf['training.lr']
-    lr_decay_rate = cf['training.lr_decay_rate']
-    NORM_MEAN = torch.cuda.FloatTensor([0.485, 0.456, 0.406])
-    NORM_STD = torch.cuda.FloatTensor([0.229, 0.224, 0.225])
-    att_crop = cf['attention.crop']
-    att_kind = cf['attention.kind']
+            model, cf['training.optimizer'], cf['training.lr'],
+            cf['training.momentum'], cf['training.weight_decay'])
 
-    # // Data access
-    # /// Data access params
-    initial_resize = 256
-    input_size = cf['torch_data.input_size']
-    train_gap = cf['torch_data.train_gap']
-    eval_gap = cf['torch_data.eval_gap']
-    fps = cf['video.fps']
-
-    # /// Batcher params
-    size_vidbatch_train = cf['torch_data.train_batcher_size']
-    size_vidbatch_eval = cf['torch_data.eval_batcher_size']
     debug_enabled = cf['utility.debug']
-    train_batch_size = cf['torch_data.video_batch_size']  # train batchsize
-    eval_batch_size = cf['torch_data.eval_batch_size']   # eval batchsize
-    num_workers = cf['torch_data.num_workers']
 
     if experiment_name == 'normal':
-        data_access_train = DataAccess_Train(
-                dataset, initial_resize, input_size,
-                train_gap, fps, False)
-        data_access_eval = DataAccess_Eval(
-                dataset, initial_resize, input_size,
-                train_gap, fps, False, eval_gap)
-        nswrap = Networks_wrap_single(model, optimizer,
-                NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
-        batcher_train = Batcher_train_basic(
-                nswrap, data_access_train, train_batch_size, num_workers)
-        batcher_eval = Batcher_eval_basic(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
-    elif experiment_name in [
-            'mirror', 'mirror_twonet',
-            'centercrop', 'centercrop_twonet',
-            'randomcrop', 'randomcrop_twonet']:
-        # Name preparation
-        en_split = experiment_name.split('_')
-        if len(en_split) == 1:
-            en_split.append('stacked')
-        transform_kind, nw_kind = en_split
-
-        data_access_train = DataAccess_plus_transformed_train(
-                dataset, initial_resize, input_size,
-                train_gap, fps, False, transform_kind,
-                cf['attention.crop'])
-        data_access_eval = DataAccess_plus_transformed_eval(
-                dataset, initial_resize, input_size,
-                train_gap, fps, False, eval_gap, transform_kind,
-                cf['attention.crop'])
-        if nw_kind == 'stacked':
-            nswrap = Networks_wrap_stacked(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
-        elif nw_kind == 'twonet':
-            assert cf['twonet.original_net_kind'] == 'fixed_old'
-            nswrap = Networks_wrap_twonet(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate,
-                    cf['twonet.fixed_net_path'])
-        batcher_train = Batcher_train_basic(
-                nswrap, data_access_train, train_batch_size, num_workers)
-        batcher_eval = Batcher_eval_basic(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
+        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        nswrap = _get_nwswrap(cf, model, optimizer, 'normal')
+        batcher_train, batcher_eval = _get_batchers(
+                cf, nswrap, data_access_train, data_access_eval, 'normal')
+    elif experiment_name in ['mirror', 'mirror_twonet',
+            'centercrop', 'centercrop_twonet', 'randomcrop', 'randomcrop_twonet']:
+        plus_transform_kind = experiment_name.split('_')[0]
+        nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
+        data_access_train, data_access_eval = _get_data_access(
+                cf, dataset, 'plus', plus_transform_kind)
+        nswrap = _get_nwswrap(cf, model, optimizer, nsw_kind)
+        batcher_train, batcher_eval = _get_batchers(
+                cf, nswrap, data_access_train, data_access_eval, 'normal')
     elif experiment_name in ['attentioncrop', 'attentioncrop_twonet']:
-        data_access_train = DataAccess_Train(
-                dataset, initial_resize, input_size,
-                train_gap, fps, True)
-        data_access_eval = DataAccess_Eval(
-                dataset, initial_resize, input_size,
-                train_gap, fps, True, eval_gap)
-        if experiment_name == 'attentioncrop':
-            nswrap = Networks_wrap_stacked(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
-        elif experiment_name == 'attentioncrop_twonet':
-            assert cf['twonet.original_net_kind'] == 'fixed_old'
-            nswrap = Networks_wrap_twonet(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind,
-                    cf['twonet.fixed_net_path'])
-        batcher_train = Batcher_train_attentioncrop(
-                nswrap, data_access_train, train_batch_size, num_workers)
-        batcher_eval = Batcher_eval_attentioncrop(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
-    elif experiment_name in ['rescaled_attentioncrop',
-            'rescaled_attentioncrop_twonet']:
-        data_access_train = DataAccess_Train(
-                dataset, initial_resize, input_size,
-                train_gap, fps, True)
-        data_access_eval = DataAccess_Eval(
-                dataset, initial_resize, input_size,
-                train_gap, fps, True, eval_gap)
-        if experiment_name == 'rescaled_attentioncrop':
-            nswrap = Networks_wrap_stacked(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind)
-        elif experiment_name == 'rescaled_attentioncrop_twonet':
-            assert cf['twonet.original_net_kind'] == 'fixed_old'
-            nswrap = Networks_wrap_twonet(model, optimizer,
-                    NORM_MEAN, NORM_STD, lr, lr_decay_rate, att_crop, att_kind,
-                    cf['twonet.fixed_net_path'])
-        batcher_train = Batcher_train_rescaled_attentioncrop(
-                nswrap, data_access_train, train_batch_size, num_workers)
-        batcher_eval = Batcher_eval_rescaled_attentioncrop(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
+        nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
+        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        nswrap = _get_nwswrap(cf, model, optimizer, nsw_kind)
+        batcher_train, batcher_eval = _get_batchers(
+                cf, nswrap, data_access_train, data_access_eval, 'attentioncrop')
+
+    elif experiment_name in ['rescaled_attentioncrop', 'rescaled_attentioncrop_twonet']:
+        nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
+        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        nswrap = _get_nwswrap(cf, model, optimizer, nsw_kind)
+        batcher_train, batcher_eval = _get_batchers(
+                cf, nswrap, data_access_train, data_access_eval, 'rescaled_attentioncrop')
     else:
         raise NotImplementedError()
 
     # // Create trainer
+    size_vidbatch_train = cf['torch_data.train_batcher_size']
+    size_vidbatch_eval = cf['torch_data.eval_batcher_size']
     trainer = Trainer(rundir, nswrap,
             batcher_train, batcher_eval,
             size_vidbatch_train, size_vidbatch_eval)

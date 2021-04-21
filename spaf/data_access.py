@@ -15,6 +15,7 @@ from torch.utils.data.dataloader import default_collate
 from spaf.utils import (
         tfm_video_resize_threaded, tfm_video_random_crop,
         tfm_video_center_crop, tfm_maybe_flip,
+        TF_params_resize, TF_params_crop, TF_params_flip,
         threaded_ocv_resize_clip,
         _get_centerbox, _get_randombox,
         tfm_uncrop_box, tfm_unresize_box,
@@ -26,15 +27,10 @@ from spaf.data.dataset import (
 log = logging.getLogger(__name__)
 
 
-class Train_Transform_Params(TypedDict):
-    resize: Any
-    rcrop: Any
-    flip: Any
-
-
-class Eval_Transform_Params(TypedDict):
-    resize: Any
-    ccrop: Any
+class TF_params_grouped(TypedDict):
+    resize: TF_params_resize
+    crop: TF_params_crop
+    flip: Optional[TF_params_flip]
 
 
 @dataclass
@@ -42,9 +38,8 @@ class Train_Meta:
     vid: str
     video_path: Path
     real_sampled_inds: np.ndarray
-    do_not_collate: bool = True
     plus_box: Optional[np.ndarray] = None
-    params: Optional[Train_Transform_Params] = None
+    params: Optional[TF_params_grouped] = None
 
 
 @dataclass
@@ -55,89 +50,29 @@ class Eval_Meta:
     unique_real_sampled_inds: np.ndarray
     plus_box: Optional[np.ndarray] = None
     rel_frame_inds: Optional[np.ndarray] = None
-    params: Optional[Eval_Transform_Params] = None
+    params: Optional[TF_params_grouped] = None
     tw: Optional[TimersWrap] = None
-
-
-# Train_Item = Tuple[torch.Tensor, torch.Tensor, Train_Meta]
-# Train_Item_plus = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Train_Meta]
 
 
 class Train_Item(TypedDict):
     X: torch.Tensor
     X_plus: Optional[torch.Tensor]
     target: torch.Tensor
-    meta: Train_Meta
+    train_meta: Train_Meta
+
+
+class Train_Item_collated(TypedDict):
+    X: torch.Tensor
+    X_plus: Optional[torch.Tensor]
+    target: torch.Tensor
+    train_meta: List[Train_Meta]
 
 
 class Eval_Item(TypedDict):
-    X: torch.Tensor
-    X_plus: Optional[torch.Tensor]
+    X: torch.Tensor   # + batch dimension
+    X_plus: Optional[torch.Tensor]  # + batch dimension
     stacked_targets: torch.Tensor
-    meta: Eval_Meta
-
-
-# new_target: str
-# target = self._adjust_train_target(X, target)
-# def _adjust_train_target(self, X, target):
-#     # Target adjustment
-#     assert len(X) == len(target)
-#     if self.new_target == 'single':
-#         pass
-#     elif self.new_target == 'append':
-#         target = target.repeat(2, 1)
-#     else:
-#         raise NotImplementedError()
-#     return target
-#
-# def _adjust_eval_target(self, input_, stacked_targets):
-#     assert input_.shape[1] == stacked_targets.shape[1]
-#     if self.new_target == 'single':
-#         pass
-#     elif self.new_target == 'append':
-#         stacked_targets = stacked_targets.repeat(1, 2, 1)
-#     else:
-#         raise NotImplementedError()
-#     return stacked_targets
-
-
-def dict_1_collate_v2(batch):
-    assert len(batch) == 1
-    batch0 = batch[0]
-    assert isinstance(batch0, collections.abc.Mapping)
-    use_shared_memory = torch.utils.data.dataloader._use_shared_memory
-    # log.info('Use shared memory {}'.format(use_shared_memory))
-    result = {}
-    for k, v in batch0.items():
-        if use_shared_memory and isinstance(v, torch.Tensor):
-            v.storage().share_memory_()
-        result[k] = v
-    return result
-
-
-def _get_dict_1_eval_dataloader_v2(gdataset, num_workers):
-    loader = torch.utils.data.DataLoader(
-        gdataset, batch_size=1,
-        shuffle=False, collate_fn=dict_1_collate_v2,
-        num_workers=num_workers, pin_memory=True)
-    return loader
-
-
-def sequence_batch_collate_v2(batch):
-    assert isinstance(batch[0], collections.abc.Sequence), \
-            'Only sequences supported'
-    transposed = zip(*batch)
-    collated = []
-    for samples in transposed:
-        if isinstance(samples[0], collections.abc.Mapping) \
-               and 'do_not_collate' in samples[0]:
-            c_samples = samples
-        elif getattr(samples[0], 'do_not_collate', False) is True:
-            c_samples = samples
-        else:
-            c_samples = default_collate(samples)
-        collated.append(c_samples)
-    return collated
+    eval_meta: Eval_Meta
 
 
 class DataAccess(ABC):
@@ -188,15 +123,15 @@ class DataAccess_Train(DataAccess):
     @staticmethod
     def _apply_training_transforms(
             X, initial_resize, input_size
-            ) -> Tuple[np.ndarray, Train_Transform_Params]:
+            ) -> Tuple[np.ndarray, TF_params_grouped]:
         X, resize_params = tfm_video_resize_threaded(X, initial_resize)
         X, rcrop_params = tfm_video_random_crop(
                 X, input_size, input_size)
         X, flip_params = tfm_maybe_flip(X)
         assert X.dtype is np.dtype('uint8'), 'must be uin8'
-        params: Train_Transform_Params = {
+        params: TF_params_grouped = {
                 'resize': resize_params,
-                'rcrop': rcrop_params,
+                'crop': rcrop_params,
                 'flip': flip_params}
         return X, params
 
@@ -221,40 +156,26 @@ class DataAccess_Train(DataAccess):
         frames_u8 = np.flip(frames_u8, -1)  # Make RGB
         target = self.sampler.sample_targets(video, sampled_times)
 
-        meta = Train_Meta(
+        train_meta = Train_Meta(
             vid=vid, video_path=video['path'],
             real_sampled_inds=real_sampled_inds)
-        return target, meta, frames_u8
+        return target, train_meta, frames_u8
 
-    def get_item(
-            self, vid: str, shift=None
-            ) -> Train_Item:
-        meta: Train_Meta
-        target, meta, frames_rgb_u8 = \
+    def get_item(self, vid: str, shift=None) -> Train_Item:
+        train_meta: Train_Meta
+        target, train_meta, frames_rgb_u8 = \
                 self._presample_training_frames(vid, shift)
         X, params = self._apply_training_transforms(frames_rgb_u8,
                 self.initial_resize, self.input_size)
         X_tensor = torch.from_numpy(X)
         if self.params_to_meta:
-            meta.params = params
+            train_meta.params = params
         train_item = Train_Item(
                 X=X_tensor,
                 X_plus=None,
                 target=target,
-                meta=meta)
+                train_meta=train_meta)
         return train_item
-
-    @staticmethod
-    def collate_batch(batch):
-        X = default_collate([x['X'] for x in batch])
-        if batch[0]['X_plus'] is not None:
-            X_plus = default_collate([x['X_plus'] for x in batch])
-        else:
-            X_plus = None
-        target = default_collate([x['target'] for x in batch])
-        meta = [x['meta'] for x in batch]
-        collated = {'X': X, 'X_plus': X_plus, 'target': target, 'meta': meta}
-        return collated
 
 
 class DataAccess_Eval(DataAccess):
@@ -278,15 +199,17 @@ class DataAccess_Eval(DataAccess):
         self.eval_gap = eval_gap
 
     @staticmethod
-    def _eval_prepare(X, initial_resize, input_size
-                      ) -> Tuple[np.ndarray, Eval_Transform_Params]:
+    def _eval_prepare(
+            X, initial_resize, input_size
+            ) -> Tuple[np.ndarray, TF_params_grouped]:
         X, resize_params = tfm_video_resize_threaded(X, initial_resize)
         X, ccrop_params = tfm_video_center_crop(
                 X, input_size, input_size)
         assert X.dtype is np.dtype('uint8'), 'must be uin8'
-        params: Eval_Transform_Params = {
+        params: TF_params_grouped = {
                 'resize': resize_params,
-                'ccrop': ccrop_params}
+                'crop': ccrop_params,
+                'flip': None}
         return X, params
 
     def _presample_evaluation_frames(self, vid: str):
@@ -330,54 +253,68 @@ class DataAccess_Eval(DataAccess):
         unique_frames_prepared_u8, params = self._eval_prepare(
                 unique_frames_rgb_u8, self.initial_resize,
                 self.input_size)
-        meta = Eval_Meta(
+        eval_meta = Eval_Meta(
             vid=vid, video_path=video['path'],
             shifts=shifts,
             unique_real_sampled_inds=unique_real_sampled_inds)
         return (unique_frames_rgb_u8, unique_frames_prepared_u8,
                 stacked_relative_sampled_inds,
-                stacked_targets, params, meta)
+                stacked_targets, params, eval_meta)
 
     def get_item(self, vid: str) -> Eval_Item:
         tw = TimersWrap(['get_unique_frames', 'prepare_inputs'])
         tw.tic('get_unique_frames')
-        meta: Eval_Meta
-        params: Eval_Transform_Params
+        eval_meta: Eval_Meta
+        params: TF_params_grouped
         (unique_frames_rgb_u8, unique_frames_prepared_u8,
                 stacked_relative_sampled_inds,
-                stacked_targets, params, meta) = \
+                stacked_targets, params, eval_meta) = \
                 self._presample_evaluation_frames(vid)
         tw.toc('get_unique_frames')
         tw.tic('prepare_inputs')
         X = unique_frames_prepared_u8[stacked_relative_sampled_inds]
         X_tensor = torch.from_numpy(X)
         tw.toc('prepare_inputs')
-        meta.tw = tw
+        eval_meta.tw = tw
         if self.params_to_meta:
-            meta.params = params
-            meta.rel_frame_inds = stacked_relative_sampled_inds
+            eval_meta.params = params
+            eval_meta.rel_frame_inds = stacked_relative_sampled_inds
         eval_item = Eval_Item(
                 X=X_tensor,
                 X_plus=None,
                 stacked_targets=stacked_targets,
-                meta=meta)
+                eval_meta=eval_meta)
         return eval_item
 
-    @staticmethod
-    def collate_batch(batch):
-        assert len(batch) == 1
-        batch0 = batch[0]
-        assert isinstance(batch0, collections.abc.Mapping)
-        return batch0
+
+def reapply_grouped_transforms(
+        frames_rgb, params: TF_params_grouped):
+    # // Repeat training video preparation
+    X = threaded_ocv_resize_clip(frames_rgb, params['resize']['dsize'])
+    p = params['crop']
+    X = X[:,
+          p['i']:p['i']+p['th'],
+          p['j']:p['j']+p['tw'], :]
+    if (params['flip'] is not None) and params['flip']['perform']:
+        X = np.flip(X, axis=2).copy()
+    # At this point out shape will be input_size x input_size
+    assert X.dtype is np.dtype('uint8'), 'must be uin8'
+    return X
 
 
-# Exotic data access variants
-
-
-def _cut_box_and_reapply_training_transforms(
-        box, frames_rgb, params: Train_Transform_Params, input_size):
+def unapply_grouped_transforms_and_cut_box(
+        box, frames_rgb, params: TF_params_grouped, input_size):
+    """
+    input_size - dim at the entrance to CNN
+    """
+    # If flip was done - this is essential
+    if (params['flip'] is not None) and params['flip']['perform']:
+        l_, t_, r_, d_ = box
+        box_ = np.r_[l_, input_size-d_, r_, input_size-t_]
+    else:
+        box_ = box.copy()
     # wrt 256-resized image, before rcrop
-    ltrd_1 = tfm_uncrop_box(box, params['rcrop'])
+    ltrd_1 = tfm_uncrop_box(box_, params['crop'])
     # wrt original image, before scale
     ltrd_0 = tfm_unresize_box(ltrd_1, params['resize'])
     l_, t_, r_, d_ = ltrd_0
@@ -385,25 +322,29 @@ def _cut_box_and_reapply_training_transforms(
     X_plus = frames_rgb[:, l_:r_, t_:d_, :]
     X_plus = threaded_ocv_resize_clip(
             X_plus, (input_size, input_size))
-    if params['flip']['perform']:
+    if (params['flip'] is not None) and params['flip']['perform']:
         X_plus = np.flip(X_plus, axis=2).copy()
     assert X_plus.dtype is np.dtype('uint8'), 'must be uin8'
     return X_plus
 
 
-def _cut_box_and_reapply_evaluation_transforms(
-        box, frames_rgb, params: Eval_Transform_Params, input_size):
-    # wrt 256-resized image, before ccrop
-    ltrd_1 = tfm_uncrop_box(box, params['ccrop'])
-    # wrt original image, before scale
-    ltrd_0 = tfm_unresize_box(ltrd_1, params['resize'])
-    l_, t_, r_, d_ = ltrd_0
-    # Cut, resize, normalize
-    X_plus = frames_rgb[:, l_:r_, t_:d_, :]
-    X_plus = threaded_ocv_resize_clip(
-            X_plus, (input_size, input_size))
-    assert X_plus.dtype is np.dtype('uint8'), 'must be uin8'
-    return X_plus
+# Exotic data access variants
+
+
+def _perform_inplace_transform(
+        transform_kind, input_size, att_crop, frames_rgb_u8, params):
+    """
+    For baselines, apply simple transform right away
+    """
+    if transform_kind == 'centercrop':
+        plus_box = _get_centerbox(input_size, input_size, att_crop, att_crop)
+    elif transform_kind == 'randomcrop':
+        plus_box = _get_randombox(input_size, input_size, att_crop, att_crop)
+    else:
+        raise NotImplementedError
+    X_plus = unapply_grouped_transforms_and_cut_box(
+            plus_box, frames_rgb_u8, params, input_size)
+    return X_plus, plus_box
 
 
 class DataAccess_plus_transformed_train(DataAccess_Train):
@@ -421,38 +362,28 @@ class DataAccess_plus_transformed_train(DataAccess_Train):
         self.att_crop = att_crop
 
     def get_item(self, vid, shift=None) -> Train_Item:
-        meta: Train_Meta
-        target, meta, frames_rgb_u8 = \
+        train_meta: Train_Meta
+        target, train_meta, frames_rgb_u8 = \
                 self._presample_training_frames(vid, shift)
         X, params = self._apply_training_transforms(frames_rgb_u8,
                 self.initial_resize, self.input_size)
         X_tensor = torch.from_numpy(X)
-        # // Second 64 frames
         if self.transform_kind == 'mirror':
             X_plus = X.copy()
-        elif self.transform_kind in ['centercrop', 'randomcrop']:
-            if self.transform_kind == 'centercrop':
-                plus_box = _get_centerbox(
-                        self.input_size, self.input_size,
-                        self.att_crop, self.att_crop)
-            elif self.transform_kind == 'randomcrop':
-                plus_box = _get_randombox(
-                        self.input_size, self.input_size,
-                        self.att_crop, self.att_crop)
-            if self.params_to_meta:
-                meta.plus_box = plus_box
-            X_plus = _cut_box_and_reapply_training_transforms(
-                    plus_box, frames_rgb_u8, params, self.input_size)
         else:
-            raise NotImplementedError
+            X_plus, plus_box = _perform_inplace_transform(
+                    self.transform_kind, self.input_size, self.att_crop,
+                    frames_rgb_u8, params)
+            if self.params_to_meta:
+                train_meta.plus_box = plus_box
         X_plus_tensor = torch.from_numpy(X_plus)
         if self.params_to_meta:
-            meta.params = params
+            train_meta.params = params
         train_item = Train_Item(
                 X=X_tensor,
                 X_plus=X_plus_tensor,
                 target=target,
-                meta=meta)
+                train_meta=train_meta)
         return train_item
 
 
@@ -470,12 +401,12 @@ class DataAccess_plus_transformed_eval(DataAccess_Eval):
         self.att_crop = att_crop
 
     def get_item(self, vid) -> Eval_Item:
-        meta: Eval_Meta
+        eval_meta: Eval_Meta
         tw = TimersWrap(['get_unique_frames', 'prepare_inputs'])
         tw.tic('get_unique_frames')
         (unique_frames_rgb_u8, unique_frames_prepared_u8,
                 stacked_relative_sampled_inds,
-                stacked_targets, params, meta) = \
+                stacked_targets, params, eval_meta) = \
                 self._presample_evaluation_frames(vid)
         tw.toc('get_unique_frames')
         tw.tic('prepare_inputs')
@@ -483,33 +414,23 @@ class DataAccess_plus_transformed_eval(DataAccess_Eval):
         X_tensor = torch.from_numpy(X)
         # // Second 64 frames
         if self.transform_kind == 'mirror':
-            unique_frames_plus = unique_frames_prepared_u8.copy()
+            X_plus = X.copy()
         elif self.transform_kind in ['centercrop', 'randomcrop']:
-            if self.transform_kind == 'centercrop':
-                plus_box = _get_centerbox(
-                        self.input_size, self.input_size,
-                        self.att_crop, self.att_crop)
-            elif self.transform_kind == 'randomcrop':
-                plus_box = _get_randombox(
-                        self.input_size, self.input_size,
-                        self.att_crop, self.att_crop)
-            if self.params_to_meta:
-                meta.plus_box = plus_box
-            unique_frames_plus = _cut_box_and_reapply_evaluation_transforms(
-                    plus_box, unique_frames_rgb_u8,
-                    params, self.input_size)
+            unique_frames_plus, plus_box = _perform_inplace_transform(
+                    self.transform_kind, self.input_size, self.att_crop,
+                    unique_frames_rgb_u8, params)
+            X_plus = unique_frames_plus[stacked_relative_sampled_inds]
         else:
             raise NotImplementedError
-        X_plus = unique_frames_plus[stacked_relative_sampled_inds]
         X_plus_tensor = torch.from_numpy(X_plus)
         tw.toc('prepare_inputs')
-        meta.tw = tw
+        eval_meta.tw = tw
         if self.params_to_meta:
-            meta.params = params
-            meta.rel_frame_inds = stacked_relative_sampled_inds
+            eval_meta.params = params
+            eval_meta.rel_frame_inds = stacked_relative_sampled_inds
         eval_item = Eval_Item(
                 X=X_tensor,
                 X_plus=X_plus_tensor,
                 stacked_targets=stacked_targets,
-                meta=meta)
+                eval_meta=eval_meta)
         return eval_item

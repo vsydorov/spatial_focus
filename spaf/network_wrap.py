@@ -508,10 +508,9 @@ class Networks_wrap(object):
                 target_cpu.cuda(), attention_loss_func)
 
         gradient = gradient.abs()
-        gradient = reduce_channel(gradient,
-                self.channel_reduce)  # B,T,H,W,1
-        gradient = reduce_frame(gradient, self.perframe_reduce,
-                framedim=1)  # B,1,H,W,1
+        gradient = reduce_channel(gradient, self.channel_reduce)  # B,T,H,W,1
+        gradient = reduce_frame(
+                gradient, self.perframe_reduce, framedim=1)  # B,1,H,W,1
         boxes = get_gradientsum_boxes(
                 gradient[:, 0], self.boxsum_conv, self.att_crop)
         return gradient, boxes
@@ -602,8 +601,8 @@ class Networks_wrap_twonet(Networks_wrap):
     """
     def __init__(self, model, optimizer, norm_mean, norm_std,
             lr, lr_decay_rate, att_crop, att_kind, fixed_net_path):
-        super().__init__(model, optimizer,
-                norm_mean, norm_std, lr, lr_decay_rate)
+        super().__init__(model, optimizer, norm_mean, norm_std,
+                lr, lr_decay_rate, att_crop, att_kind)
         self.fixed_net_path = fixed_net_path
         self.model_fixed = copy.deepcopy(self.model)
         self.tmwrap_fixed = TModel_wrap(self.model_fixed, norm_mean, norm_std)

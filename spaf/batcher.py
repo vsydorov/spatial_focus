@@ -1,9 +1,7 @@
 import logging
-import re
 import collections
-from abc import abstractmethod, ABC
+from typing import (Dict, List, TypedDict)
 from pathlib import Path
-from typing import (Dict, List)
 
 import numpy as np
 from tqdm import tqdm
@@ -13,15 +11,16 @@ from torch.utils.data.dataloader import default_collate
 
 import vst
 
-from spaf.network_wrap import (
-        TModel_wrap, Networks_wrap)
+from spaf.network_wrap import (Networks_wrap)
 from spaf.data_access import (
         DataAccess, DataAccess_Train, DataAccess_Eval,
         TDataset_over_DataAccess, Train_Meta, Eval_Meta,
-        Train_Item, Eval_Item)
+        TF_params_grouped, Train_Item, Train_Item_collated, Eval_Item,
+        reapply_grouped_transforms, unapply_grouped_transforms_and_cut_box)
 from spaf.utils import (
         tfm_video_resize_threaded, tfm_video_random_crop,
         tfm_video_center_crop, tfm_maybe_flip,
+        TF_params_resize, TF_params_crop, TF_params_flip,
         threaded_ocv_resize_clip,
         _get_centerbox, _get_randombox,
         tfm_uncrop_box, tfm_unresize_box,
@@ -79,6 +78,47 @@ def _tqdm_str(pbar, ninc=0):
                 pbar.n + ninc, pbar.total,
                 pbar._time()-pbar.start_t) + ']'
     return tqdm_str
+
+
+# Dataloader logic
+
+
+def collate_train_items(batch: List[Train_Item]) -> Train_Item_collated:
+    X = default_collate([x['X'] for x in batch])
+    if batch[0]['X_plus'] is not None:
+        X_plus = default_collate([x['X_plus'] for x in batch])
+    else:
+        X_plus = None
+    target = default_collate([x['target'] for x in batch])
+    train_meta = [x['train_meta'] for x in batch]
+    collated: Train_Item_collated = {
+            'X': X, 'X_plus': X_plus,
+            'target': target, 'train_meta': train_meta}
+    return collated
+
+
+def fake_collate_batch0(batch):
+    assert len(batch) == 1
+    batch0 = batch[0]
+    assert isinstance(batch0, collections.abc.Mapping)
+    return batch0
+
+
+def get_train_dataloader(
+        tdataset, batch_size, num_workers):
+    dloader = torch.utils.data.DataLoader(
+        tdataset, batch_size=batch_size,
+        collate_fn=collate_train_items,
+        shuffle=False, drop_last=True,
+        num_workers=num_workers, pin_memory=True)
+    return dloader
+
+def get_batch0_dataloader(tdataset, num_workers):
+    dloader = torch.utils.data.DataLoader(
+        tdataset, batch_size=1,
+        collate_fn=fake_collate_batch0, shuffle=False,
+        num_workers=num_workers, pin_memory=True)
+    return dloader
 
 
 # New batcher philosophy
@@ -168,6 +208,7 @@ class Isaver_midepoch_eval(vst.isave.Isaver_base):
 
 class Batcher_train_basic(object):
     nswrap: Networks_wrap
+    data_access: DataAccess_Train
 
     def __init__(
             self, nswrap, data_access, batch_size, num_workers):
@@ -185,20 +226,13 @@ class Batcher_train_basic(object):
         isaver.run()
 
     def train_on_vids(self, i_meta, batch_of_vids) -> None:
-        time_period = '::10'
         twrap = TimersWrap(['data', 'gpu'])
-        twrap.tic('data')
 
-        # _get_sequences_batch_train_dataloader_v2
         tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
-        loader = torch.utils.data.DataLoader(
-            tdataset, batch_size=self.batch_size,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, drop_last=True,
-            num_workers=self.num_workers,
-            pin_memory=True)
-
-        for i, train_item in enumerate(loader):
+        dloader = get_train_dataloader(tdataset, self.batch_size, self.num_workers)
+        train_item: Train_Item_collated
+        twrap.tic('data')
+        for i, train_item in enumerate(dloader):
             twrap.toc('data'); twrap.tic('gpu')
             output_ups, loss, target_ups = \
                 self.nswrap.forward_model_for_training(
@@ -208,13 +242,14 @@ class Batcher_train_basic(object):
             self.nswrap.optimizer.step()
             self.nswrap.optimizer.zero_grad()
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Execute time {}/{} - {time}'.format(
-                    i, len(loader), time=twrap.time_str))
+
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
 
 
 class Batcher_eval_basic(object):
     nswrap: Networks_wrap
+    data_access: DataAccess_Eval
 
     def __init__(
             self, nswrap, data_access, batch_size, num_workers):
@@ -230,169 +265,121 @@ class Batcher_eval_basic(object):
         return output_items
 
     def eval_on_vids(self, i_meta, batch_of_vids) -> Dict:
-        time_period = '::10'
-        twrap = TimersWrap(['data', 'gpu_prepare', 'gpu'])
-        twrap.tic('data')
         output_items = {}
+        twrap = TimersWrap(['data', 'gpu'])
 
-        # _get_dict_1_eval_dataloader_v2
         tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
-        loader = torch.utils.data.DataLoader(
-            tdataset, batch_size=1,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, num_workers=self.num_workers, pin_memory=True)
-
-        for i, eval_item in enumerate(loader):
+        dloader = get_batch0_dataloader(tdataset, self.num_workers)
+        eval_item: Eval_Item
+        twrap.tic('data')
+        for i, eval_item in enumerate(dloader):
             twrap.toc('data'); twrap.tic('gpu')
             output_item = self.nswrap.forward_model_for_eval_cpu(
                     eval_item['X'], eval_item['X_plus'],
                     eval_item['stacked_targets'], self.batch_size)
-            vid = eval_item['meta'].vid
+            vid = eval_item['eval_meta'].vid
             output_items[vid] = output_item
-
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Execute time {}/{} - {time}'.format(
-                    i, len(loader), time=twrap.time_str))
+
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
         return output_items
 
 
+class Boxdict_train(TypedDict):
+    boxes: np.ndarray
+    train_target: torch.Tensor
+    train_meta: List[Train_Meta]
+
+
+class Boxdict_eval(TypedDict):
+    boxes: np.ndarray
+    eval_target: torch.Tensor
+    eval_meta: Eval_Meta
+
+
 class BoxDictTrainDataset(torch.utils.data.Dataset):
-    def __init__(self, boxdicts):
+    boxdicts: Dict[int, Boxdict_train]
+
+    def __init__(self, boxdicts, input_size):
         super().__init__()
-        self.input_size = 224
         self.boxdicts = boxdicts
-        self.initial_resize = 256
-        self.norm_mean = np.array(
-                [0.485, 0.456, 0.406], dtype=np.float32)
-        self.norm_std = np.array(
-                [0.229, 0.224, 0.225], dtype=np.float32)
+        self.input_size = input_size
 
     def __len__(self):
         return len(self.boxdicts)
 
-    @staticmethod
-    def collate_batch(batch):
-        assert len(batch) == 1
-        batch0 = batch[0]
-        assert isinstance(batch0, collections.abc.Mapping)
-        return batch0
-
-    def __getitem__(self, index):
+    def __getitem__(self, index) -> Train_Item_collated:
         boxdict = self.boxdicts[index]
-        stacked_X_np = []
-        stacked_X_plus_np = []
-        meta: Train_Meta
-        for i, (box, meta) in enumerate(
+        stacked_X_np_ = []
+        stacked_X_plus_np_ = []
+        train_meta: Train_Meta
+        for i, (box, train_meta) in enumerate(
                 zip(boxdict['boxes'], boxdict['train_meta'])):
-            with video_capture_open(meta.video_path, np.inf) as vcap:
-                frames = np.array(video_sample(vcap, meta.real_sampled_inds))
+            assert train_meta.params is not None
+            with video_capture_open(train_meta.video_path, np.inf) as vcap:
+                frames = np.array(video_sample(vcap, train_meta.real_sampled_inds))
             frames_rgb = np.flip(frames, -1)
+            # Repeat preparations
+            X = reapply_grouped_transforms(frames_rgb, train_meta.params)
+            # Cut box, prepare
+            X_plus = unapply_grouped_transforms_and_cut_box(
+                    box, frames_rgb, train_meta.params, self.input_size)
+            stacked_X_np_.append(X)
+            stacked_X_plus_np_.append(X_plus)
+        stacked_X_np = np.stack(stacked_X_np_)
+        stacked_X_plus_np = np.stack(stacked_X_plus_np_)
 
-            # // Repeat training video preparation
-            X = threaded_ocv_resize_clip(
-                    frames_rgb, self.initial_resize)
-            p = meta.params['rcrop']
-            X = X[:,
-                  p['i']:p['i']+p['th'],
-                  p['j']:p['j']+p['tw'], :]
-            if meta.params['flip']['perform']:
-                X = np.flip(X, axis=2).copy()
-
-            if meta.params['flip']['perform']:
-                l_, t_, r_, d_ = box
-                box_ = np.r_[l_, self.input_size-d_, r_, self.input_size-t_]
-            else:
-                box_ = box.copy()
-
-            # Cut box and prepare it
-            ltrd_1 = tfm_uncrop_box(box_, meta.params['rcrop'])
-            ltrd_0 = tfm_unresize_box(ltrd_1, meta.params['resize'])
-            l_, t_, r_, d_ = ltrd_0
-            X_plus = frames_rgb[:, l_:r_, t_:d_, :]
-            if meta.params['flip']['perform']:
-                X_plus = np.flip(X_plus, axis=2).copy()
-            X_plus = threaded_ocv_resize_clip(X_plus,
-                    (self.input_size, self.input_size))
-            stacked_X_np.append(X)
-            stacked_X_plus_np.append(X_plus)
-        stacked_X_np = np.stack(stacked_X_np)
-        stacked_X_plus_np = np.stack(stacked_X_plus_np)
-
-        assert stacked_X_np.dtype is np.dtype('uint8'), 'must be uin8'
-        assert stacked_X_plus_np.dtype is np.dtype('uint8'), 'must be uin8'
-
-        train_item = Train_Item(
+        train_item = Train_Item_collated(
                 X=torch.from_numpy(stacked_X_np),
                 X_plus=torch.from_numpy(stacked_X_plus_np),
                 target=boxdict['train_target'],
-                meta=boxdict['train_meta'])
+                train_meta=boxdict['train_meta'])
         return train_item
 
 
 class BoxDictEvalDataset(torch.utils.data.Dataset):
-    def __init__(self, boxdicts):
+    boxdicts: Dict[int, Boxdict_eval]
+
+    def __init__(self, boxdicts, input_size):
         super().__init__()
-        self.input_size = 224
         self.boxdicts = boxdicts
-        self.initial_resize = 256
-        self.norm_mean = np.array(
-                [0.485, 0.456, 0.406], dtype=np.float32)
-        self.norm_std = np.array(
-                [0.229, 0.224, 0.225], dtype=np.float32)
+        self.input_size = input_size
 
     def __len__(self):
         return len(self.boxdicts)
 
-    @staticmethod
-    def collate_batch(batch):
-        assert len(batch) == 1
-        batch0 = batch[0]
-        assert isinstance(batch0, collections.abc.Mapping)
-        return batch0
-
-    def __getitem__(self, index):
+    def __getitem__(self, index) -> Eval_Item:
         boxdict = self.boxdicts[index]
-        meta: Eval_Meta = boxdict['eval_meta']
+        eval_meta: Eval_Meta = boxdict['eval_meta']
+        assert eval_meta.params is not None
+        assert eval_meta.rel_frame_inds is not None
 
-        with video_capture_open(meta.video_path, np.inf) as vcap:
+        with video_capture_open(eval_meta.video_path, np.inf) as vcap:
             unique_frames = np.array(video_sample(
-                vcap, meta.unique_real_sampled_inds))
+                vcap, eval_meta.unique_real_sampled_inds))
         unique_frames_rgb = np.flip(unique_frames, -1)
 
         # // Repeat eval video preparation (same centercrop everywhere)
-        unique_prepared = threaded_ocv_resize_clip(
-            unique_frames_rgb, self.initial_resize)
-        p = meta.params['ccrop']
-        unique_prepared = unique_prepared[:,
-                p['i']:p['i']+p['th'],
-                p['j']:p['j']+p['tw'], :]
+        unique_prepared = reapply_grouped_transforms(
+                unique_frames_rgb, eval_meta.params)
+        X = unique_prepared[eval_meta.rel_frame_inds]  # eval_gap,64..
 
         # // Cut box and prepare it (different boxes)
-        stacked_X_plus_np = []
+        stacked_X_plus_np_ = []
         for i, (box, rel_frame_inds) in enumerate(
-                zip(boxdict['boxes'], meta.rel_frame_inds)):
-            # Cut box and prepare it
-            ltrd_1 = tfm_uncrop_box(box, meta.params['ccrop'])
-            ltrd_0 = tfm_unresize_box(ltrd_1, meta.params['resize'])
-            l_, t_, r_, d_ = ltrd_0
-            # Sample from original frames
+                zip(boxdict['boxes'], eval_meta.rel_frame_inds)):
             current_frames_rgb = unique_frames_rgb[rel_frame_inds]
-            second64 = current_frames_rgb[:, l_:r_, t_:d_, :]
-            second64 = threaded_ocv_resize_clip(second64,
-                    (self.input_size, self.input_size))
-            stacked_X_plus_np.append(second64)
-        stacked_X_plus_np = np.stack(stacked_X_plus_np)  # eval_gap,64,224,224,3
-
-        X = unique_prepared[meta.rel_frame_inds]  # eval_gap,64..
-        assert X.dtype is np.dtype('uint8'), 'must be uin8'
-        assert stacked_X_plus_np.dtype is np.dtype('uint8'), 'must be uin8'
+            X_plus = unapply_grouped_transforms_and_cut_box(
+                    box, current_frames_rgb, eval_meta.params, self.input_size)
+            stacked_X_plus_np_.append(X_plus)
+        stacked_X_plus_np = np.stack(stacked_X_plus_np_)  # eval_gap,64,224,224,3
 
         eval_item = Eval_Item(
                 X=torch.from_numpy(X),
                 X_plus=torch.from_numpy(stacked_X_plus_np),
                 stacked_targets=boxdict['eval_target'],
-                meta=meta)
+                eval_meta=eval_meta)
         return eval_item
 
 
@@ -415,55 +402,35 @@ class Batcher_train_attentioncrop(object):
                 self.train_on_vids, '0::1')
         isaver.run()
 
-    def _prepare_boxinputs(
-            self, loader, twrap, i_meta, time_period='::10'):
-        boxdicts = {}
+    def train_on_vids(self, i_meta, batch_of_vids) -> None:
+        twrap = TimersWrap(['data', 'gpu'])
+
+        # Prepare box dicts
+        tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
+        dloader = get_train_dataloader(tdataset, self.batch_size, self.num_workers)
+        boxdicts: Dict[int, Boxdict_train] = {}
+        train_item: Train_Item_collated
         twrap.tic('data')
-        train_item: Train_Item
-        for i, train_item in enumerate(loader):
+        for i, train_item in enumerate(dloader):
             assert train_item['X_plus'] is None
             twrap.toc('data'); twrap.tic('gpu')
             gradient, boxes = self.nswrap.get_attention_gradient_v2(
                     train_item['X'], train_item['target'])
-            boxdict = {
-                    'boxes': boxes,
+            boxdict: Boxdict_train = {'boxes': boxes,
                     'train_target': train_item['target'],
-                    'train_meta': train_item['meta']}
+                    'train_meta': train_item['train_meta']}
             boxdicts[i] = boxdict
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Prepare time {}/{} - {time}'.format(
-                    i, len(loader), time=twrap.time_str))
             # if self.debug_enabled:
             #     dfold = vst.mkdir(self._hacky_folder/'debug')
             #     self._debug_boxinputs(
             #             dfold, X_f32c.cpu(), gradient, boxes, i_meta, i)
-        return boxdicts
-
-    def train_on_vids(self, i_meta, batch_of_vids) -> None:
-        time_period = '::10'
-        twrap = TimersWrap(['data', 'gpu'])
-        twrap.tic('data')
-
-        # Prepare box dicts
-        boxinput_dataset = TDataset_over_DataAccess(
-                self.data_access, batch_of_vids)
-        boxinput_loader = torch.utils.data.DataLoader(
-            boxinput_dataset, batch_size=self.batch_size,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, drop_last=True,
-            num_workers=self.num_workers, pin_memory=True)
-        boxdicts = self._prepare_boxinputs(
-                boxinput_loader, twrap, i_meta, time_period)
 
         # Train on box dicts (looks just like normal training)
-        boxdict_dataset = BoxDictTrainDataset(boxdicts)
-        boxdict_loader = torch.utils.data.DataLoader(
-            boxdict_dataset, batch_size=1,
-            collate_fn=boxdict_dataset.collate_batch,
-            shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        tdataset_bd = BoxDictTrainDataset(boxdicts, self.data_access.input_size)
+        dloader_bd = get_batch0_dataloader(tdataset_bd, self.num_workers)
         twrap.tic('data')
-        for i, train_item in enumerate(boxdict_loader):
+        for i, train_item in enumerate(dloader_bd):
             twrap.toc('data'); twrap.tic('gpu')
             output_ups, loss, target_ups = \
                 self.nswrap.forward_model_for_training(
@@ -473,9 +440,6 @@ class Batcher_train_attentioncrop(object):
             self.nswrap.optimizer.step()
             self.nswrap.optimizer.zero_grad()
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Execute time {}/{} - {time}'.format(
-                    i, len(boxdict_loader), time=twrap.time_str))
 
             # if self.debug_enabled:
             #     dfold = small.mkdir(self._hacky_folder/'debug')
@@ -489,6 +453,9 @@ class Batcher_train_attentioncrop(object):
             #         quick_video_save(
             #             dfold/'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(
             #                 i_meta, i, j), v)
+
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
 
 class Batcher_eval_attentioncrop(object):
     nswrap: Networks_wrap
@@ -507,61 +474,60 @@ class Batcher_eval_attentioncrop(object):
         output_items = isaver.run()
         return output_items
 
-    def _prepare_boxinputs(self, loader, twrap, i_meta, time_period='::10'):
-        boxdicts = {}
-        twrap.tic('data')
+    def eval_on_vids(self, i_meta, batch_of_vids) -> Dict:
+        output_items = {}
+        twrap = TimersWrap(['data', 'gpu'])
+
+        # Prepare box dicts
+        tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
+        dloader = get_batch0_dataloader(tdataset, self.num_workers)
+        boxdicts: Dict[int, Boxdict_eval] = {}
         eval_item: Eval_Item
-        for i, eval_item in enumerate(loader):
+        twrap.tic('data')
+        for i, eval_item in enumerate(dloader):
             assert eval_item['X_plus'] is None
             twrap.toc('data'); twrap.tic('gpu')
             gradient, boxes = self.nswrap.get_attention_gradient_v2(
                     eval_item['X'], eval_item['stacked_targets'])
-            boxdict = {
-                    'boxes': boxes,
+            boxdict: Boxdict_eval = {'boxes': boxes,
                     'eval_target': eval_item['stacked_targets'],
-                    'eval_meta': eval_item['meta']}
+                    'eval_meta': eval_item['eval_meta']}
             boxdicts[i] = boxdict
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Prepare time {}/{} - {time}'.format(
-                    i, len(loader), time=twrap.time_str))
-        return boxdicts
-
-    def eval_on_vids(self, i_meta, batch_of_vids) -> Dict:
-        time_period = '::10'
-        twrap = TimersWrap(['data', 'gpu_prepare', 'gpu'])
-        twrap.tic('data')
-        output_items = {}
-
-        # Prepare box dicts
-        boxinput_dataset = TDataset_over_DataAccess(
-                self.data_access, batch_of_vids)
-        boxinput_loader = torch.utils.data.DataLoader(
-            boxinput_dataset, batch_size=1,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, num_workers=self.num_workers, pin_memory=True)
-        boxdicts = self._prepare_boxinputs(
-                boxinput_loader, twrap, i_meta, time_period)
 
         # Eval on box dicts (looks just like normal eval)
-        boxdict_dataset = BoxDictEvalDataset(boxdicts)
-        boxdict_loader = torch.utils.data.DataLoader(
-            boxdict_dataset, batch_size=1,
-            collate_fn=boxdict_dataset.collate_batch,
-            shuffle=False, num_workers=self.num_workers, pin_memory=True)
-        for i, eval_item in enumerate(boxdict_loader):
+        tdataset_bd = BoxDictEvalDataset(boxdicts, self.data_access.input_size)
+        dloader_bd = get_batch0_dataloader(tdataset_bd, self.num_workers)
+        for i, eval_item in enumerate(dloader_bd):
             twrap.toc('data'); twrap.tic('gpu')
             output_item = self.nswrap.forward_model_for_eval_cpu(
                     eval_item['X'], eval_item['X_plus'],
                     eval_item['stacked_targets'], self.batch_size)
-            vid = eval_item['meta'].vid
+            vid = eval_item['eval_meta'].vid
             output_items[vid] = output_item
-
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Execute time {}/{} - {time}'.format(
-                    i, len(boxdict_loader), time=twrap.time_str))
+
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
         return output_items
+
+
+def boxwise_extract_upscale(X, boxes, input_size: int):
+    # Conversion to avoid crash at interpolate
+    X_f32_unnorm = X.type(torch.FloatTensor)  # type: ignore
+    # Extract box, rescale to (input_size x input_size)
+    eboxes224_ = []
+    for i, box in enumerate(boxes):
+        l_, t_, r_, d_ = box
+        ebox = X_f32_unnorm[i, :, l_:r_, t_:d_, :]
+        ebox_prm = ebox.permute(0, 3, 1, 2)
+        ebox224_prm = torch.nn.functional.interpolate(
+                ebox_prm, (input_size, input_size),
+                mode='bilinear', align_corners=True)
+        ebox224 = ebox224_prm.permute(0, 2, 3, 1)
+        eboxes224_.append(ebox224)
+    X_plus = torch.stack(eboxes224_)
+    return X_plus
 
 
 class Batcher_train_rescaled_attentioncrop(object):
@@ -584,43 +550,21 @@ class Batcher_train_rescaled_attentioncrop(object):
         isaver.run()
 
     def train_on_vids(self, i_meta, batch_of_vids) -> None:
-        time_period = '::10'
         twrap = TimersWrap(['data', 'gpu'])
+
+        tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
+        dloader = get_train_dataloader(tdataset, self.batch_size, self.num_workers)
+        train_item: Train_Item_collated
         twrap.tic('data')
-
-        tdataset = TDataset_over_DataAccess(
-                self.data_access, batch_of_vids)
-        loader = torch.utils.data.DataLoader(
-            tdataset, batch_size=self.batch_size,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, drop_last=True,
-            num_workers=self.num_workers,
-            pin_memory=True)
-
-        for i, train_item in enumerate(loader):
+        for i, train_item in enumerate(dloader):
             twrap.toc('data'); twrap.tic('gpu')
             gradient, boxes = self.nswrap.get_attention_gradient_v2(
                     train_item['X'], train_item['target'])
-            X_f32_unnorm = train_item['X'].type(torch.FloatTensor)
-            # Extract box, rescale to 224x224
-            eboxes224_ = []
-            for i_box, box in enumerate(boxes):
-                l_, t_, r_, d_ = box
-                ebox = X_f32_unnorm[i_box, :, l_:r_, t_:d_, :]
-                ebox_prm = ebox.permute(0, 3, 1, 2)
-                ebox224_prm = torch.nn.functional.interpolate(ebox_prm,
-                        (224, 224),
-                        mode='bilinear', align_corners=True)
-                ebox224 = ebox224_prm.permute(0, 2, 3, 1)
-                eboxes224_.append(ebox224)
-            eboxes224 = torch.stack(eboxes224_)
-
-            del X_f32_unnorm
-
+            X_plus = boxwise_extract_upscale(train_item['X'], boxes,
+                     self.data_access.input_size)
             output_ups, loss, target_ups = \
                 self.nswrap.forward_model_for_training(
-                    train_item['X'], eboxes224, train_item['target'])
-
+                    train_item['X'], X_plus, train_item['target'])
             self.ewrap.update(loss, output_ups, target_ups)
             loss.backward()
             self.nswrap.optimizer.step()
@@ -639,6 +583,9 @@ class Batcher_train_rescaled_attentioncrop(object):
             #         quick_video_save(
             #             dfold/'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(
             #                 i_meta, i, j), v)
+
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
 
 
 class Batcher_eval_rescaled_attentioncrop(object):
@@ -659,50 +606,26 @@ class Batcher_eval_rescaled_attentioncrop(object):
         return output_items
 
     def eval_on_vids(self, i_meta, batch_of_vids) -> Dict:
-        time_period = '::10'
-        twrap = TimersWrap(['data', 'gpu_prepare', 'gpu'])
-        twrap.tic('data')
         output_items = {}
+        twrap = TimersWrap(['data', 'gpu'])
 
-        # _get_dict_1_eval_dataloader_v2
         tdataset = TDataset_over_DataAccess(self.data_access, batch_of_vids)
-        loader = torch.utils.data.DataLoader(
-            tdataset, batch_size=1,
-            collate_fn=self.data_access.collate_batch,
-            shuffle=False, num_workers=self.num_workers, pin_memory=True)
-
-        for i, eval_item in enumerate(loader):
+        dloader = get_batch0_dataloader(tdataset, self.num_workers)
+        eval_item: Eval_Item
+        twrap.tic('data')
+        for i, eval_item in enumerate(dloader):
             twrap.toc('data'); twrap.tic('gpu')
-
             gradient, boxes = self.nswrap.get_attention_gradient_v2(
                     eval_item['X'], eval_item['stacked_targets'])
-
-            X_f32_unnorm = eval_item['X'].type(torch.FloatTensor)
-            # Extract box, rescale to 224x224
-            eboxes224_ = []
-            for i, box in enumerate(boxes):
-                l_, t_, r_, d_ = box
-                ebox = X_f32_unnorm[i, :, l_:r_, t_:d_, :]
-                ebox_prm = ebox.permute(0, 3, 1, 2)
-                ebox224_prm = torch.nn.functional.interpolate(ebox_prm,
-                        (224, 224),
-                        mode='bilinear', align_corners=True)
-                ebox224 = ebox224_prm.permute(0, 2, 3, 1)
-                eboxes224_.append(ebox224)
-            eboxes224 = torch.stack(eboxes224_)
-
-            del X_f32_unnorm
-
+            X_plus = boxwise_extract_upscale(eval_item['X'], boxes,
+                     self.data_access.input_size)
             output_item = self.nswrap.forward_model_for_eval_cpu(
-                    eval_item['X'], eboxes224,
+                    eval_item['X'], X_plus,
                     eval_item['stacked_targets'], self.batch_size)
-            vid = eval_item['meta'].vid
+            vid = eval_item['eval_meta'].vid
             output_items[vid] = output_item
-
             twrap.toc('gpu'); twrap.tic('data')
-            if vst.check_step(i, time_period):
-                log.debug('Execute time {}/{} - {time}'.format(
-                    i, len(loader), time=twrap.time_str))
+
             #
             # if self.debug_enabled:
             #     dfold = vst.mkdir(self._hacky_folder/'debug')
@@ -717,4 +640,6 @@ class Batcher_eval_rescaled_attentioncrop(object):
             #             dfold/'eval_vis_M{:03d}_Iunk_J{:03d}_execute'.format(
             #                 i, j), v)
 
+        if vst.check_step(i_meta, '::1'):
+            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
         return output_items

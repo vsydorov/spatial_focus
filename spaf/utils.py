@@ -9,7 +9,7 @@ import re
 import shutil
 import string
 from pathlib import Path
-from typing import (Dict)
+from typing import (Dict, TypedDict, Tuple)
 
 import numpy as np
 import cv2
@@ -138,96 +138,89 @@ def _get_centerbox(h_before, w_before, th, tw):
     i = int((h_before-th)/2)
     j = int((w_before-tw)/2)
     return np.r_[i, j, i+th, j+tw]
-#
-#
-# def ffmpeg_video_info(path):
-#     probe = ffmpeg.probe(path)
-#     video_stream = next((
-#         stream for stream in probe['streams']
-#         if stream['codec_type'] == 'video'), None)
-#     assert video_stream is not None
-#     return video_stream
-#
-#
-# def ffmpeg_video_frames_read(video_path, fps):
-#     video_stream = ffmpeg_video_info(video_path)
-#     width = int(video_stream['width'])
-#     height = int(video_stream['height'])
-#     ffmpeg_prepare = ffmpeg.input(video_path)
-#     if fps is None:
-#         ffmpeg_prepare = ffmpeg_prepare.output(
-#                 'pipe:', format='rawvideo', pix_fmt='rgb24')
-#     else:
-#         ffmpeg_prepare = ffmpeg_prepare.output(
-#                 'pipe:', format='rawvideo', pix_fmt='rgb24', r=fps)
-#     fout, _ = ffmpeg_prepare.run(capture_stdout=True, capture_stderr=True)
-#     video_frames = (
-#         np
-#         .frombuffer(fout, np.uint8)
-#         .reshape([-1, height, width, 3])
-#     )
-#     if fps is None:
-#         fps = video_stream['avg_frame_rate'].split('/')
-#         fps = float(fps[0]) / float(fps[1])
-#     return video_frames, fps
 
 
 """ Transforms """
 
+class TF_params_resize(TypedDict):
+    dsize: int
+    h_before: int
+    w_before: int
+    h_resized: int
+    w_resized: int
 
-def tfm_video_resize_threaded(X, dsize, max_workers=8):
+class TF_params_crop(TypedDict):
+    th: int
+    tw: int
+    h_before: int
+    w_before: int
+    i: int
+    j: int
+
+class TF_params_flip(TypedDict):
+    perform: bool
+
+
+def tfm_video_resize_threaded(
+        X, dsize, max_workers=8
+        ) -> Tuple[np.ndarray, TF_params_resize]:
     # 256 resize, normalize, group,
     h_before, w_before = X.shape[1:3]
     X = threaded_ocv_resize_clip(X, dsize)
     h_resized, w_resized = X.shape[1:3]
-    params = {'h_before': h_before, 'w_before': w_before,
-              'h_resized': h_resized, 'w_resized': w_resized}
+    params: TF_params_resize = {'dsize': dsize,
+            'h_before': h_before, 'w_before': w_before,
+            'h_resized': h_resized, 'w_resized': w_resized}
     return X, params
 
 
-def tfm_video_random_crop(first64, th, tw):
+def tfm_video_random_crop(
+        first64, th, tw
+        ) -> Tuple[np.ndarray, TF_params_crop]:
     h_before, w_before = first64.shape[1:3]
     rcrop_i = randint0(h_before - th)
     rcrop_j = randint0(w_before - tw)
     first64 = first64[:,
             rcrop_i:rcrop_i+th,
             rcrop_j:rcrop_j+tw, :]
-    params = {'h_before': h_before, 'w_before': w_before,
-              'i': rcrop_i, 'j': rcrop_j,
-              'th': th, 'tw': tw}
+    params: TF_params_crop = {'th': th, 'tw': tw,
+            'h_before': h_before, 'w_before': w_before,
+            'i': rcrop_i, 'j': rcrop_j}
     return first64, params
 
 
-def tfm_video_center_crop(first64, th, tw):
+def tfm_video_center_crop(
+        first64, th, tw
+        ) -> Tuple[np.ndarray, TF_params_crop]:
     h_before, w_before = first64.shape[1:3]
     ccrop_i = int((h_before-th)/2)
     ccrop_j = int((w_before-tw)/2)
     first64 = first64[:,
             ccrop_i:ccrop_i+th,
             ccrop_j:ccrop_j+tw, :]
-    params = {'h_before': h_before, 'w_before': w_before,
-              'i': ccrop_i, 'j': ccrop_j,
-              'th': th, 'tw': tw}
+    params: TF_params_crop = {'th': th, 'tw': tw,
+            'h_before': h_before, 'w_before': w_before,
+             'i': ccrop_i, 'j': ccrop_j}
     return first64, params
 
 
-def tfm_maybe_flip(first64):
+def tfm_maybe_flip(first64) -> Tuple[np.ndarray, TF_params_flip]:
     perform_video_flip = np.random.random() < 0.5
     if perform_video_flip:
         first64 = np.flip(first64, axis=2).copy()
-    params = {'perform': perform_video_flip}
+    params: TF_params_flip = {'perform': perform_video_flip}
     return first64, params
 
 
 """ Reverse Transforms """
 
 
-def tfm_uncrop_box(box, params):
+def tfm_uncrop_box(box, params: TF_params_crop):
     i, j = params['i'], params['j']
     return box + [i, j, i, j]
 
 
-def tfm_unresize_box(box, params):
+def tfm_unresize_box(box, params: TF_params_resize):
     real_scale_h = params['h_resized']/params['h_before']
     real_scale_w = params['w_resized']/params['w_before']
     real_scale = np.tile(np.r_[real_scale_h, real_scale_w], 2)
