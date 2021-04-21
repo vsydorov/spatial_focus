@@ -94,10 +94,7 @@ torch_data:
 
 attention:
     crop: 128
-    kind: !def ['hacky', ['hacky', 'entropy', 'cheating']]
-    perframe_reduce: !def ['max', ['max', 'min']]
-    batch_attend: False
-    new_target: !def ['append', ['single', 'append']]
+    kind: !def ['entropy', ['hacky', 'entropy', 'cheating']]
 
 twonet:
     original_net_kind: !def ['fixed_old', ['fixed_old', 'new']]
@@ -320,26 +317,7 @@ def _get_batchers(cf, nswrap, data_access_train, data_access_eval, ba_kind):
         raise RuntimeError()
     return batcher_train, batcher_eval
 
-
-# Experiments
-
-
-def train_baseline(workfolder, cfg_dict, add_args):
-    out, = vst.exp.get_subfolders(workfolder, ['out'])
-    cfg = vst.exp.YConfig(cfg_dict)
-    cfg.set_defaults_yaml(DEFAULTS)
-    cf = cfg.parse()
-    period_specs = cfg.without_prefix('period.')
-    cull_specs = cfg.without_prefix('torch_data.cull.')
-    rundir = vst.mkdir(out/'RUNDIR')
-
-    enforce_all_seeds(cf['manual_seed'])
-    set_env()
-
-    experiment_name = cf['experiment']
-
-    # // Data preparation
-    dataset = vst.load_pkl(cf['inputs.dataset'])
+def _prepare_trainer(cf, rundir, dataset):
     if isinstance(dataset, Dataset_charades):
         nclass = 157
     else:
@@ -352,6 +330,7 @@ def train_baseline(workfolder, cfg_dict, add_args):
             model, cf['training.optimizer'], cf['training.lr'],
             cf['training.momentum'], cf['training.weight_decay'])
 
+    experiment_name = cf['experiment']
     if experiment_name == 'normal':
         data_access_train, data_access_eval = _get_data_access(
                 cf, dataset, 'normal')
@@ -392,11 +371,57 @@ def train_baseline(workfolder, cfg_dict, add_args):
     trainer = Trainer(rundir, nswrap,
             batcher_train, batcher_eval,
             size_vidbatch_train, size_vidbatch_eval)
+    return trainer
 
+
+
+# Experiments
+
+
+def train_baseline(workfolder, cfg_dict, add_args):
+    out, = vst.exp.get_subfolders(workfolder, ['out'])
+    cfg = vst.exp.YConfig(cfg_dict)
+    cfg.set_defaults_yaml(DEFAULTS)
+    cf = cfg.parse()
+    rundir = vst.mkdir(out/'RUNDIR')
+
+    enforce_all_seeds(cf['manual_seed'])
+    set_env()
+
+    # // Data preparation
+    dataset = vst.load_pkl(cf['inputs.dataset'])
+    cull_specs = cfg.without_prefix('torch_data.cull.')
     train_vids, eval_vids_dict = prepare_charades_vids_v2(dataset, cull_specs)
+    trainer = _prepare_trainer(cf, rundir, dataset)
 
+    # Train/Evaluation loop
+    period_specs = cfg.without_prefix('period.')
     if '--eval' in add_args:
         recheck = '--recheck' in add_args
         _eval_loop(period_specs, trainer, eval_vids_dict, recheck)
     else:
         _train_loop(cf, period_specs, trainer, train_vids, eval_vids_dict)
+
+
+def eval_specific(workfolder, cfg_dict, add_args):
+    out, = vst.exp.get_subfolders(workfolder, ['out'])
+    cfg = vst.exp.YConfig(cfg_dict)
+    cfg.set_defaults_yaml(DEFAULTS)
+    cf = cfg.parse()
+    rundir = vst.mkdir(out/'RUNDIR')
+
+    enforce_all_seeds(cf['manual_seed'])
+    set_env()
+
+    # // Data preparation
+    dataset = vst.load_pkl(cf['inputs.dataset'])
+    cull_specs = cfg.without_prefix('torch_data.cull.')
+    train_vids, eval_vids_dict = prepare_charades_vids_v2(dataset, cull_specs)
+    trainer = _prepare_trainer(cf, rundir, dataset)
+
+    # No loop necessary
+    vst.additional_logging(trainer.rundir/'EVAL'/'eval')
+    trainer.nswrap.restore_model_magic(
+            None, cf['inputs.model'],
+            cf['training.start_epoch'], cf['model.type'])
+    trainer.evaluation_subloop(0, eval_vids_dict)
