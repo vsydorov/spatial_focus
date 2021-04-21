@@ -153,3 +153,44 @@ def video_sample(cap, framenumbers) -> List:
     for i in framenumbers:
         sampled_BGR.append(frames_BGR[i])
     return sampled_BGR
+
+
+"""
+Writing videos
+
+video_path = vt_cv.suffix_helper(video_path, 'XVID')
+with vt_cv.video_writer_open(
+        video_path, sizeWH, 10, 'XVID') as vout:
+    ...
+    vout.write(im)
+"""
+# These values work for me
+FOURCC_TO_CONTAINER = {
+        'VP90': '.webm',
+        'XVID': '.avi',
+        'MJPG': '.avi',
+        'H264': '.mp4',
+        'MP4V': '.mp4'
+}
+
+
+def suffix_helper(video_path: Path, fourcc) -> Path:
+    """Change video suffix based on 4cc"""
+    return video_path.with_suffix(FOURCC_TO_CONTAINER[fourcc])
+
+
+@contextmanager
+def video_writer_open(
+        video_path: Path,
+        size_WH: Tuple[int, int],
+        framerate: float,
+        fourcc):
+
+    cv_fourcc = cv2.VideoWriter_fourcc(*fourcc)
+    vout = cv2.VideoWriter(str(video_path), cv_fourcc, framerate, size_WH)
+    try:
+        if not vout.isOpened():
+            raise IOError(f'OpenCV cannot open {video_path} for writing')
+        yield vout
+    finally:
+        vout.release()

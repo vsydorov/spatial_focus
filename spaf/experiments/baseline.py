@@ -295,6 +295,7 @@ def _get_batchers(cf, nswrap, data_access_train, data_access_eval, ba_kind):
     train_batch_size = cf['torch_data.video_batch_size']  # train batchsize
     eval_batch_size = cf['torch_data.eval_batch_size']   # eval batchsize
     num_workers = cf['torch_data.num_workers']
+    debug_enabled = cf['utility.debug']
 
     if ba_kind == 'normal':
         batcher_train = Batcher_train_basic(
@@ -303,14 +304,18 @@ def _get_batchers(cf, nswrap, data_access_train, data_access_eval, ba_kind):
                 nswrap, data_access_eval, eval_batch_size, num_workers)
     elif ba_kind == 'attentioncrop':
         batcher_train = Batcher_train_attentioncrop(
-                nswrap, data_access_train, train_batch_size, num_workers)
+                nswrap, data_access_train, train_batch_size,
+                num_workers, debug_enabled)
         batcher_eval = Batcher_eval_attentioncrop(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
+                nswrap, data_access_eval, eval_batch_size,
+                num_workers, debug_enabled)
     elif ba_kind == 'rescaled_attentioncrop':
         batcher_train = Batcher_train_rescaled_attentioncrop(
-                nswrap, data_access_train, train_batch_size, num_workers)
+                nswrap, data_access_train, train_batch_size,
+                num_workers, debug_enabled)
         batcher_eval = Batcher_eval_rescaled_attentioncrop(
-                nswrap, data_access_eval, eval_batch_size, num_workers)
+                nswrap, data_access_eval, eval_batch_size,
+                num_workers, debug_enabled)
     else:
         raise RuntimeError()
     return batcher_train, batcher_eval
@@ -347,15 +352,14 @@ def train_baseline(workfolder, cfg_dict, add_args):
             model, cf['training.optimizer'], cf['training.lr'],
             cf['training.momentum'], cf['training.weight_decay'])
 
-    debug_enabled = cf['utility.debug']
-
     if experiment_name == 'normal':
-        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        data_access_train, data_access_eval = _get_data_access(
+                cf, dataset, 'normal')
         nswrap = _get_nwswrap(cf, model, optimizer, 'normal')
         batcher_train, batcher_eval = _get_batchers(
                 cf, nswrap, data_access_train, data_access_eval, 'normal')
-    elif experiment_name in ['mirror', 'mirror_twonet',
-            'centercrop', 'centercrop_twonet', 'randomcrop', 'randomcrop_twonet']:
+    elif experiment_name in ['mirror', 'mirror_twonet', 'centercrop',
+            'centercrop_twonet', 'randomcrop', 'randomcrop_twonet']:
         plus_transform_kind = experiment_name.split('_')[0]
         nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
         data_access_train, data_access_eval = _get_data_access(
@@ -365,17 +369,20 @@ def train_baseline(workfolder, cfg_dict, add_args):
                 cf, nswrap, data_access_train, data_access_eval, 'normal')
     elif experiment_name in ['attentioncrop', 'attentioncrop_twonet']:
         nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
-        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        data_access_train, data_access_eval = _get_data_access(
+                cf, dataset, 'normal')
         nswrap = _get_nwswrap(cf, model, optimizer, nsw_kind)
         batcher_train, batcher_eval = _get_batchers(
                 cf, nswrap, data_access_train, data_access_eval, 'attentioncrop')
-
-    elif experiment_name in ['rescaled_attentioncrop', 'rescaled_attentioncrop_twonet']:
+    elif experiment_name in [
+            'rescaled_attentioncrop', 'rescaled_attentioncrop_twonet']:
         nsw_kind = 'twonet' if 'twonet' in experiment_name else 'stacked'
-        data_access_train, data_access_eval = _get_data_access(cf, dataset, 'normal')
+        data_access_train, data_access_eval = _get_data_access(
+                cf, dataset, 'normal')
         nswrap = _get_nwswrap(cf, model, optimizer, nsw_kind)
         batcher_train, batcher_eval = _get_batchers(
-                cf, nswrap, data_access_train, data_access_eval, 'rescaled_attentioncrop')
+                cf, nswrap, data_access_train,
+                data_access_eval, 'rescaled_attentioncrop')
     else:
         raise NotImplementedError()
 

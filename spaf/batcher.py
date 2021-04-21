@@ -3,6 +3,7 @@ import collections
 from typing import (Dict, List, TypedDict)
 from pathlib import Path
 
+import cv2
 import numpy as np
 from tqdm import tqdm
 
@@ -25,7 +26,9 @@ from spaf.utils import (
         _get_centerbox, _get_randombox,
         tfm_uncrop_box, tfm_unresize_box,
         TimersWrap)
-from spaf.data.video import (OCV_rstats, video_capture_open, video_sample)
+from spaf.data.video import (
+        OCV_rstats, video_capture_open, video_sample,
+        video_writer_open, suffix_helper)
 
 log = logging.getLogger(__name__)
 
@@ -383,24 +386,85 @@ class BoxDictEvalDataset(torch.utils.data.Dataset):
         return eval_item
 
 
+def scale_01(X):
+    max_ = np.max(X)
+    min_ = np.min(X)
+    spread = max_-min_
+    X = (X-min_)/spread
+    return X
+
+
+def upscale_u8(X):
+    return (X*255).astype(np.uint8)
+
+
+def cv_box(img, box_,
+        box_color=(30, 30, 255),
+        box_thickness: int = 2):
+    # Box configs
+    box_pt1 = tuple(box_[:2])
+    box_pt2 = tuple(box_[2:])
+    cv2.rectangle(img, box_pt1, box_pt2, box_color, box_thickness)
+    return img
+
+
+def quick_video_save(filepath, X_BGR):
+    assert len(X_BGR.shape) == 4
+    H, W = X_BGR.shape[1:3]
+    video_path = suffix_helper(filepath, 'XVID')
+    with video_writer_open(video_path, (W, H), 10, 'XVID') as vout:
+        for frame in X_BGR:
+            vout.write(frame)
+
+
+def _debug_stacked(debug_folder, X, X_plus, i_meta, i):
+    concat = np.concatenate((X.numpy(), X_plus.numpy()), axis=3)
+    concat_bgr = np.flip(concat, axis=-1)
+    for j, v in enumerate(concat_bgr):
+        quick_video_save(debug_folder/
+            'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(i_meta, i, j), v)
+
+
 class Batcher_train_attentioncrop(object):
     nswrap: Networks_wrap
     data_access: DataAccess_Train
 
     def __init__(
-            self, nswrap, data_access, batch_size, num_workers):
+            self, nswrap, data_access, batch_size, num_workers, debug_enabled):
         self.nswrap = nswrap
         self.data_access = data_access
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.debug_enabled = debug_enabled
 
         self.ewrap = TrainEpochWrap()
 
     def execute_epoch(self, batches_of_vids, folder, epoch) -> None:
+        self._execute_folder = folder
         isaver = Isaver_midepoch_train(folder, batches_of_vids,
                 self.nswrap.model, self.nswrap.optimizer,
                 self.train_on_vids, '0::1')
         isaver.run()
+
+    def _debug_boxinputs(self, gradient, boxes, train_item, i_meta, i):
+        debug_folder = vst.mkdir(self._execute_folder/'debug')
+        gradient_np = gradient.cpu().numpy()  # B, 1, H, W, 1
+        Xs = [scale_01(g)[0, :, :, 0] for g in gradient_np]  # [H, W]
+        heatmaps = [cv2.applyColorMap(
+            upscale_u8(x), cv2.COLORMAP_JET) for x in Xs]
+        # Make frames
+        X_bgr = np.flip(train_item['X'].numpy(), axis=-1).copy()
+        for j, (input_bgr, heatmap) in enumerate(zip(X_bgr, heatmaps)):
+            vis_frames_ = []
+            box = boxes[j]
+            for f in input_bgr:
+                f = cv_box(f.copy(), box[[1, 0, 3, 2]])
+                f = cv2.addWeighted(f, 1, heatmap, 0.5, 0)
+                vis_frames_.append(f)
+            vis_frames = np.array(vis_frames_)
+            quick_video_save(
+                debug_folder/'vis_M{:03d}_I{:03d}_J{:03d}_prepare'.format(
+                    i_meta, i, j), vis_frames)
 
     def train_on_vids(self, i_meta, batch_of_vids) -> None:
         twrap = TimersWrap(['data', 'gpu'])
@@ -421,16 +485,15 @@ class Batcher_train_attentioncrop(object):
                     'train_meta': train_item['train_meta']}
             boxdicts[i] = boxdict
             twrap.toc('gpu'); twrap.tic('data')
-            # if self.debug_enabled:
-            #     dfold = vst.mkdir(self._hacky_folder/'debug')
-            #     self._debug_boxinputs(
-            #             dfold, X_f32c.cpu(), gradient, boxes, i_meta, i)
+            if self.debug_enabled:
+                self._debug_boxinputs(gradient, boxes, train_item, i_meta, i)
 
         # Train on box dicts (looks just like normal training)
         tdataset_bd = BoxDictTrainDataset(boxdicts, self.data_access.input_size)
         dloader_bd = get_batch0_dataloader(tdataset_bd, self.num_workers)
         twrap.tic('data')
         for i, train_item in enumerate(dloader_bd):
+            assert train_item['X_plus'] is not None
             twrap.toc('data'); twrap.tic('gpu')
             output_ups, loss, target_ups = \
                 self.nswrap.forward_model_for_training(
@@ -440,19 +503,9 @@ class Batcher_train_attentioncrop(object):
             self.nswrap.optimizer.step()
             self.nswrap.optimizer.zero_grad()
             twrap.toc('gpu'); twrap.tic('data')
-
-            # if self.debug_enabled:
-            #     dfold = small.mkdir(self._hacky_folder/'debug')
-            #     half = X_f32c.shape[1]//2
-            #     input_denorm_ups_bgr = np.flip(upscale_u8(
-            #             np_denormalize(X_f32c.cpu().numpy())), axis=-1)
-            #     bigger = input_denorm_ups_bgr[:, :half]
-            #     smaller = input_denorm_ups_bgr[:, half:]
-            #     concat = np.concatenate((bigger, smaller), axis=3)
-            #     for j, v in enumerate(concat):
-            #         quick_video_save(
-            #             dfold/'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(
-            #                 i_meta, i, j), v)
+            if self.debug_enabled:
+                _debug_stacked(vst.mkdir(self._execute_folder/'debug'),
+                        train_item['X'], train_item['X_plus'], i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
             log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
@@ -462,11 +515,12 @@ class Batcher_eval_attentioncrop(object):
     data_access: DataAccess_Eval
 
     def __init__(
-            self, nswrap, data_access, batch_size, num_workers):
+            self, nswrap, data_access, batch_size, num_workers, debug_enabled):
         self.nswrap = nswrap
         self.data_access = data_access
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.debug_enabled = debug_enabled
 
     def execute_epoch(self, batches_of_vids, folder, epoch):
         isaver = Isaver_midepoch_eval(folder, batches_of_vids,
@@ -527,6 +581,7 @@ def boxwise_extract_upscale(X, boxes, input_size: int):
         ebox224 = ebox224_prm.permute(0, 2, 3, 1)
         eboxes224_.append(ebox224)
     X_plus = torch.stack(eboxes224_)
+    X_plus = X_plus.type(torch.uint8)
     return X_plus
 
 
@@ -535,15 +590,17 @@ class Batcher_train_rescaled_attentioncrop(object):
     data_access: DataAccess_Train
 
     def __init__(
-            self, nswrap, data_access, batch_size, num_workers):
+            self, nswrap, data_access, batch_size, num_workers, debug_enabled):
         self.nswrap = nswrap
         self.data_access = data_access
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.debug_enabled = debug_enabled
 
         self.ewrap = TrainEpochWrap()
 
     def execute_epoch(self, batches_of_vids, folder, epoch) -> None:
+        self._execute_folder = folder
         isaver = Isaver_midepoch_train(folder, batches_of_vids,
                 self.nswrap.model, self.nswrap.optimizer,
                 self.train_on_vids, '0::1')
@@ -570,19 +627,9 @@ class Batcher_train_rescaled_attentioncrop(object):
             self.nswrap.optimizer.step()
             self.nswrap.optimizer.zero_grad()
             twrap.toc('gpu'); twrap.tic('data')
-
-            # if self.debug_enabled:
-            #     dfold = vst.mkdir(self._hacky_folder/'debug')
-            #     half = stacked_f32c.shape[1]//2
-            #     input_denorm_ups_bgr = np.flip(upscale_u8(
-            #             np_denormalize(stacked_f32c.cpu().numpy())), axis=-1)
-            #     bigger = input_denorm_ups_bgr[:, :half]
-            #     smaller = input_denorm_ups_bgr[:, half:]
-            #     concat = np.concatenate((bigger, smaller), axis=3)
-            #     for j, v in enumerate(concat):
-            #         quick_video_save(
-            #             dfold/'vis_M{:03d}_I{:03d}_J{:03d}_execute'.format(
-            #                 i_meta, i, j), v)
+            if self.debug_enabled:
+                _debug_stacked(vst.mkdir(self._execute_folder/'debug'),
+                        train_item['X'], X_plus, i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
             log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
@@ -593,13 +640,15 @@ class Batcher_eval_rescaled_attentioncrop(object):
     data_access: DataAccess_Eval
 
     def __init__(
-            self, nswrap, data_access, batch_size, num_workers):
+            self, nswrap, data_access, batch_size, num_workers, debug_enabled):
         self.nswrap = nswrap
         self.data_access = data_access
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.debug_enabled = debug_enabled
 
     def execute_epoch(self, batches_of_vids, folder, epoch):
+        self._execute_folder = folder
         isaver = Isaver_midepoch_eval(folder, batches_of_vids,
                 self.eval_on_vids, '0::1')
         output_items = isaver.run()
@@ -625,20 +674,9 @@ class Batcher_eval_rescaled_attentioncrop(object):
             vid = eval_item['eval_meta'].vid
             output_items[vid] = output_item
             twrap.toc('gpu'); twrap.tic('data')
-
-            #
-            # if self.debug_enabled:
-            #     dfold = vst.mkdir(self._hacky_folder/'debug')
-            #     half = stacked_f32c.shape[1]//2
-            #     input_denorm_ups_bgr = np.flip(upscale_u8(
-            #             np_denormalize(stacked_f32c.cpu().numpy())), axis=-1)
-            #     bigger = input_denorm_ups_bgr[:, :half]
-            #     smaller = input_denorm_ups_bgr[:, half:]
-            #     concat = np.concatenate((bigger, smaller), axis=3)
-            #     for j, v in enumerate(concat):
-            #         quick_video_save(
-            #             dfold/'eval_vis_M{:03d}_Iunk_J{:03d}_execute'.format(
-            #                 i, j), v)
+            if self.debug_enabled:
+                _debug_stacked(vst.mkdir(self._execute_folder/'debug'),
+                        eval_item['X'], X_plus, i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
             log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
