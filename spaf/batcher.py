@@ -170,7 +170,7 @@ class Isaver_midepoch_train(vst.isave.Isaver_base0):
         start_i = self._restore_model()
         batches_of_vids_left = self.batches_of_vids[start_i+1:]
         pbar = enumerate(batches_of_vids_left, start=start_i+1)
-        pbar = tqdm(pbar)
+        pbar = tqdm(pbar, total=len(batches_of_vids_left))
         for i_meta, batch_of_vids in pbar:
             self.train_routine(i_meta, batch_of_vids)
             # Save check

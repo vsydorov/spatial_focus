@@ -38,6 +38,23 @@ def batch_and_cache_vids(folder, vids, size_vidbatch, shuffle=True):
         vst.save_pkl(metabatch_file, batches_of_vids)
     return batches_of_vids
 
+def worker_killed_by_signal(e):
+    return bool(re.match(r"DataLoader worker .* killed by signal", str(e)))
+
+def signal_kill_restart(func_batcher, num_attempts=99):
+    for i_attempt in range(num_attempts):
+        try:
+            return func_batcher()
+        except RuntimeError as e:
+            SIGNAL_KILL = worker_killed_by_signal(e)
+            SIGNAL_KILL |= 'exited unexpectedly' in str(e) and worker_killed_by_signal(e.__cause__)
+            if SIGNAL_KILL:
+                log.info(f'Caught signal kill "{e}", restarting batcher, attempt {i_attempt}/{num_attempts}')
+            else:
+                log.info('Caught different signal, attempt {i_attempt}/{num_attempts}, raising')
+                raise e
+    raise RuntimeError(f'Too many batcher restart attempts {i_attempt}')
+
 
 class Trainer(object):
     rundir: Path
@@ -130,8 +147,13 @@ class Trainer(object):
 
         batches_of_vids = batch_and_cache_vids(
                 batcher_folder, vids, self.size_vidbatch_train, shuffle=True)
-        train_meters = self.batcher_train.execute_epoch(
-                batches_of_vids, batcher_folder, epoch)
+
+        def func_batcher():
+            return self.batcher_train.execute_epoch(
+                    batches_of_vids, batcher_folder, epoch)
+
+        train_meters = signal_kill_restart(func_batcher)
+
         # # Stats
         # train_meters_str = ' '.join(['{}: {m.avg:.4f}'.format(
         #         k, m=train_meters[k]) for k in ['loss', 'acc1', 'acc5']])
@@ -147,8 +169,12 @@ class Trainer(object):
 
         batches_of_vids = batch_and_cache_vids(
                 batcher_folder, vids, self.size_vidbatch_eval, shuffle=False)
-        output_items = self.batcher_eval.execute_epoch(
-                batches_of_vids, batcher_folder, epoch)
+
+        def func_batcher():
+            return self.batcher_eval.execute_epoch(
+                    batches_of_vids, batcher_folder, epoch)
+
+        output_items = signal_kill_restart(func_batcher)
         results_mkinds = self.nswrap.outputs_items_to_results(output_items)
 
         # Stats
