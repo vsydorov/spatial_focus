@@ -124,7 +124,8 @@ class DataAccess_Train(DataAccess):
     def _apply_training_transforms(
             X, initial_resize, input_size
             ) -> Tuple[np.ndarray, TF_params_grouped]:
-        X, resize_params = tfm_video_resize_threaded(X, initial_resize)
+        X, resize_params = tfm_video_resize_threaded(
+                X, initial_resize)
         X, rcrop_params = tfm_video_random_crop(
                 X, input_size, input_size)
         X, flip_params = tfm_maybe_flip(X)
@@ -202,7 +203,8 @@ class DataAccess_Eval(DataAccess):
     def _eval_prepare(
             X, initial_resize, input_size
             ) -> Tuple[np.ndarray, TF_params_grouped]:
-        X, resize_params = tfm_video_resize_threaded(X, initial_resize)
+        X, resize_params = tfm_video_resize_threaded(
+                X, initial_resize)
         X, ccrop_params = tfm_video_center_crop(
                 X, input_size, input_size)
         assert X.dtype is np.dtype('uint8'), 'must be uin8'

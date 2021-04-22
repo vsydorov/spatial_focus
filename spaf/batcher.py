@@ -22,7 +22,6 @@ from spaf.utils import (
         tfm_video_resize_threaded, tfm_video_random_crop,
         tfm_video_center_crop, tfm_maybe_flip,
         TF_params_resize, TF_params_crop, TF_params_flip,
-        threaded_ocv_resize_clip,
         _get_centerbox, _get_randombox,
         tfm_uncrop_box, tfm_unresize_box,
         TimersWrap)
@@ -247,7 +246,7 @@ class Batcher_train_basic(object):
             twrap.toc('gpu'); twrap.tic('data')
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
 
 
 class Batcher_eval_basic(object):
@@ -285,7 +284,7 @@ class Batcher_eval_basic(object):
             twrap.toc('gpu'); twrap.tic('data')
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
         return output_items
 
 
@@ -508,7 +507,7 @@ class Batcher_train_attentioncrop(object):
                         train_item['X'], train_item['X_plus'], i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
 
 class Batcher_eval_attentioncrop(object):
     nswrap: Networks_wrap
@@ -562,7 +561,7 @@ class Batcher_eval_attentioncrop(object):
             twrap.toc('gpu'); twrap.tic('data')
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
         return output_items
 
 
@@ -632,7 +631,7 @@ class Batcher_train_rescaled_attentioncrop(object):
                         train_item['X'], X_plus, i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
 
 
 class Batcher_eval_rescaled_attentioncrop(object):
@@ -679,5 +678,5 @@ class Batcher_eval_rescaled_attentioncrop(object):
                         eval_item['X'], X_plus, i_meta, i)
 
         if vst.check_step(i_meta, '::1'):
-            log.debug('Execute time at i_meta {} - {}'.format(i, twrap.time_str))
+            log.debug('Execute time at i_meta {} - {}'.format(i_meta, twrap.time_str))
         return output_items

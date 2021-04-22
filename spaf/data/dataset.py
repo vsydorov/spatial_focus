@@ -1,6 +1,7 @@
 """
 Basic classes that allow working with external datasets
 """
+import time
 import hashlib
 import csv
 import re
@@ -195,11 +196,25 @@ class Sampler_charades(object):
 
     def sample_frames(
             self, video: Video_charades,
-            real_sampled_inds: np.ndarray) -> np.ndarray:
+            real_sampled_inds: np.ndarray,
+            # Prevent crashes
+            num_attempts=30, wait_time=2,
+            ) -> np.ndarray:
+        """
+        cv2 video capture often non-deterministically fails, try to compensate
+        """
         video_path = video['path']
-        with video_capture_open(video_path, np.inf) as vcap:
-            frames_u8 = np.array(video_sample(vcap, real_sampled_inds))
-        return frames_u8
+        for i_attempt in range(num_attempts):
+            try:
+                with video_capture_open(video_path, np.inf) as vcap:
+                    frames_u8 = np.array(video_sample(vcap, real_sampled_inds, video_path))
+                return frames_u8
+            except (IOError, RuntimeError, NotImplementedError) as e:
+                log.warning('Failed to read video {}, frames {}, attempt {}/{}. Got error {}'.format(
+                    video_path, real_sampled_inds, i_attempt, num_attempts, e))
+                time.sleep(wait_time)
+        raise IOError('Failed to read video {}, frames {} after {} attempts'.format(
+            video_path, real_sampled_inds, i_attempt))
 
     def sample_targets(
             self, video: Video_charades,

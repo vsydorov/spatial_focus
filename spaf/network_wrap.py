@@ -265,11 +265,8 @@ class TModel_wrap(object):
         for split_ii in split_indices:
             # Split
             split_u8 = X_u8[split_ii]
-            # Send to cuda
-            split_f32c = self.to_gpu_and_normalize(split_u8)
-            # Output stuff
             with torch.no_grad():
-                split_output = self.forward_model(split_f32c)
+                split_output = self.forward_model(split_u8)
             output.append(split_output)
         output = torch.cat(output, dim=0)
         return output

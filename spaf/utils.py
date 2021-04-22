@@ -23,6 +23,8 @@ from torch.utils.data.dataloader import default_collate
 
 log = logging.getLogger(__name__)
 
+OCV_RESIZE_THREADS = 2
+
 
 def enforce_all_seeds(seed):
     np.random.seed(seed)
@@ -112,11 +114,13 @@ def yana_ocv_resize_clip(X, dsize):
 
 
 def threaded_ocv_resize_clip(
-        X, dsize, max_workers=8,
+        X, dsize, resize_threads=None,
         interpolation=cv2.INTER_LINEAR):
+    if resize_threads is None:
+        resize_threads = OCV_RESIZE_THREADS
     isize = yana_size_query(X, dsize)
     thread_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers)
+            max_workers=resize_threads)
     futures = []
     for img in X:
         futures.append(thread_executor.submit(
@@ -161,9 +165,7 @@ class TF_params_flip(TypedDict):
     perform: bool
 
 
-def tfm_video_resize_threaded(
-        X, dsize, max_workers=8
-        ) -> Tuple[np.ndarray, TF_params_resize]:
+def tfm_video_resize_threaded(X, dsize) -> Tuple[np.ndarray, TF_params_resize]:
     # 256 resize, normalize, group,
     h_before, w_before = X.shape[1:3]
     X = threaded_ocv_resize_clip(X, dsize)

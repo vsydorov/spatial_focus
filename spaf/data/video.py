@@ -20,7 +20,7 @@ class OCV_rstats(TypedDict):
 
 
 @contextmanager
-def video_capture_open(video_path, tries=1):
+def video_capture_open(video_path, tries=np.inf, wait_time=1):
     i = 0
     while i < tries:
         try:
@@ -30,7 +30,7 @@ def video_capture_open(video_path, tries=1):
             else:
                 raise IOError(f'OpenCV cannot open {video_path}')
         except Exception:
-            time.sleep(1)
+            time.sleep(wait_time)
             i += 1
 
     if not cap.isOpened():
@@ -97,7 +97,8 @@ class VideoCaptureError(RuntimeError):
 
 def video_sorted_enumerate(cap,
         sorted_framenumbers,
-        throw_on_failure=True):
+        throw_on_failure=True,
+        debug_filename=None):
     """
     Fast opencv frame iteration
     - Only operates on sorted frames
@@ -114,11 +115,12 @@ def video_sorted_enumerate(cap,
 
     def stop_at_0():
         if ret == 0:
+            FAIL_MESSAGE = "Failed to read frame {} from '{}'".format(
+                    f_current, debug_filename)
             if throw_on_failure:
-                raise VideoCaptureError(
-                        f'Failed to read frame {f_current}')
+                raise VideoCaptureError(FAIL_MESSAGE)
             else:
-                log.warning(f'Failed to read frame {f_current}')
+                log.warning(FAIL_MESSAGE)
                 return
 
     assert (np.diff(sorted_framenumbers) >= 0).all(), \
@@ -144,10 +146,11 @@ def video_sorted_enumerate(cap,
         assert f_current == int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
 
-def video_sample(cap, framenumbers) -> List:
+def video_sample(cap, framenumbers, debug_filename=None) -> List:
     sorted_framenumber = np.unique(framenumbers)
     frames_BGR = {}
-    for i, frame_BGR in video_sorted_enumerate(cap, sorted_framenumber):
+    for i, frame_BGR in video_sorted_enumerate(
+            cap, sorted_framenumber, debug_filename=debug_filename):
         frames_BGR[i] = frame_BGR
     sampled_BGR = []
     for i in framenumbers:
