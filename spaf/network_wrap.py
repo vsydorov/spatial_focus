@@ -247,8 +247,7 @@ class TModel_wrap(object):
         self.norm_std = norm_std
 
     def to_gpu_and_normalize(self, X_u8):
-        X_f32c = X_u8.type(
-                torch.cuda.FloatTensor, non_blocking=True)
+        X_f32c = X_u8.type(torch.cuda.FloatTensor, non_blocking=True)
         X_f32c /= 255
         X_f32c = (X_f32c-self.norm_mean)/self.norm_std
         return X_f32c
@@ -535,11 +534,12 @@ class Networks_wrap_single(Networks_wrap):
     def forward_model_for_eval_cpu(
             self, X, X_plus, target, batch_size) -> Item_output:
         assert X_plus is None
-        output_X = self.tmwrap.forward_model_batchwise_nograd(X, batch_size).cpu()
+        output_X = self.tmwrap.forward_model_batchwise_nograd(
+                X, batch_size).cpu().numpy()
         output_item: Item_output = {
                 'output_X': output_X,
                 'output_X_plus': None,
-                'target': target}
+                'target': target.numpy()}
         return output_item
 
     def outputs_items_to_results(
@@ -573,8 +573,8 @@ class Networks_wrap_stacked(Networks_wrap):
             self, X, X_plus, target, batch_size) -> Item_output:
         X_concat = torch.cat((X, X_plus), axis=1)  # type: ignore
         output_concat = self.tmwrap.forward_model_batchwise_nograd(
-                X_concat, batch_size).cpu()
-        target_concat = target.repeat(1, 2, 1)
+                X_concat, batch_size).cpu().numpy()
+        target_concat = target.repeat(1, 2, 1).numpy()
         output_item: Item_output = {
                 'output_X': output_concat,
                 'output_X_plus': None,
@@ -620,13 +620,13 @@ class Networks_wrap_twonet(Networks_wrap):
     def forward_model_for_eval_cpu(
             self, X, X_plus, target, batch_size) -> Item_output:
         output_X = self.tmwrap_fixed.forward_model_batchwise_nograd(
-                X, batch_size).cpu()
+                X, batch_size).cpu().numpy()
         output_X_plus = self.tmwrap.forward_model_batchwise_nograd(
-                X_plus, batch_size).cpu()
+                X_plus, batch_size).cpu().numpy()
         output_item: Item_output = {
                 'output_X': output_X,
                 'output_X_plus': output_X_plus,
-                'target': target}
+                'target': target.numpy()}
         return output_item
 
     def outputs_items_to_results(
@@ -653,3 +653,11 @@ class Networks_wrap_twonet(Networks_wrap):
                 'zoomed': metrics_X_plus,
                 'reduced': metrics_reduced}
         return results
+
+    def set_train(self):
+        super().set_train()
+        self.model_fixed.train()
+
+    def set_eval(self):
+        super().set_eval()
+        self.model_fixed.eval()

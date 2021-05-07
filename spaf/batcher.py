@@ -99,11 +99,24 @@ def collate_train_items(batch: List[Train_Item]) -> Train_Item_collated:
     return collated
 
 
+# def fake_collate_batch0(batch):
+#     assert len(batch) == 1
+#     batch0 = batch[0]
+#     assert isinstance(batch0, collections.abc.Mapping)
+#     return batch0
+
+
 def fake_collate_batch0(batch):
     assert len(batch) == 1
     batch0 = batch[0]
     assert isinstance(batch0, collections.abc.Mapping)
-    return batch0
+    result = {}
+    for k, v in batch0.items():
+        if isinstance(v, torch.Tensor) and \
+                (torch.utils.data.get_worker_info() is not None):
+            v.storage().share_memory_()
+        result[k] = v
+    return result
 
 
 def get_train_dataloader(
@@ -119,7 +132,7 @@ def get_batch0_dataloader(tdataset, num_workers):
     dloader = torch.utils.data.DataLoader(
         tdataset, batch_size=1,
         collate_fn=fake_collate_batch0, shuffle=False,
-        num_workers=num_workers, pin_memory=True)
+        num_workers=num_workers, pin_memory=False)
     return dloader
 
 

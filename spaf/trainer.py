@@ -1,4 +1,5 @@
-from __future__ import annotations
+import traceback
+import sys
 import re
 import shutil
 import numpy as np
@@ -14,9 +15,6 @@ import vst
 
 from spaf.utils import (enforce_all_seeds, get_period_actions)
 from spaf.network_wrap import (mkinds_to_string)
-if typing.TYPE_CHECKING:
-    from spaf.network_wrap import (TModel_wrap, Networks_wrap_single)
-    from spaf.batcher import (Batcher_train_basic, Batcher_eval_basic)
 
 log = logging.getLogger(__name__)
 
@@ -38,33 +36,44 @@ def batch_and_cache_vids(folder, vids, size_vidbatch, shuffle=True):
         vst.save_pkl(metabatch_file, batches_of_vids)
     return batches_of_vids
 
-def worker_killed_by_signal(e):
-    return bool(re.match(r"DataLoader worker .* killed by signal", str(e)))
-
 def signal_kill_restart(func_batcher, num_attempts=99):
     for i_attempt in range(num_attempts):
         try:
             return func_batcher()
         except RuntimeError as e:
-            SIGNAL_KILL = worker_killed_by_signal(e)
-            SIGNAL_KILL |= 'exited unexpectedly' in str(e) and worker_killed_by_signal(e.__cause__)
-            if SIGNAL_KILL:
+            tb = traceback.format_exc()
+            if re.search(r"DataLoader worker .* killed by signal", tb):
                 log.info(f'Caught signal kill "{e}", restarting batcher, attempt {i_attempt}/{num_attempts}')
             else:
                 log.info('Caught different signal, attempt {i_attempt}/{num_attempts}, raising')
                 raise e
     raise RuntimeError(f'Too many batcher restart attempts {i_attempt}')
 
+def signal_kill_restart_reduce_workers(func_batcher, batcher):
+    initial_num_workers = batcher.num_workers
+    while True:
+        try:
+            result = func_batcher()
+            batcher.num_workers = initial_num_workers
+            return result
+        except RuntimeError as e:
+            tb = traceback.format_exc()
+            if re.search(r"DataLoader worker .* killed by signal", tb):
+                batcher.num_workers = max(0, batcher.num_workers - 1)
+                log.info('Caught signal kill "{}", restarting batcher, workers {}->{}'.format(
+                    e, initial_num_workers, batcher.num_workers))
+            else:
+                log.info(f'Caught different signal, workers {batcher.num_workers}, raising')
+                raise e
 
 class Trainer(object):
     rundir: Path
-    nswrap: Networks_wrap_single
-    batcher_train: Batcher_train_basic
-    batcher_eval: Batcher_eval_basic
+    # nswrap: Networks_wrap_single
+    # batcher_train: Batcher_train_basic
+    # batcher_eval: Batcher_eval_basic
 
     def __init__(self, rundir: Path,
-            nswrap: Networks_wrap_single,
-            batcher_train, batcher_eval,
+            nswrap, batcher_train, batcher_eval,
             size_vidbatch_train, size_vidbatch_eval):
 
         self.rundir = rundir
@@ -152,7 +161,8 @@ class Trainer(object):
             return self.batcher_train.execute_epoch(
                     batches_of_vids, batcher_folder, epoch)
 
-        train_meters = signal_kill_restart(func_batcher)
+        train_meters = signal_kill_restart_reduce_workers(
+                func_batcher, self.batcher_train)
 
         # # Stats
         # train_meters_str = ' '.join(['{}: {m.avg:.4f}'.format(
@@ -174,7 +184,9 @@ class Trainer(object):
             return self.batcher_eval.execute_epoch(
                     batches_of_vids, batcher_folder, epoch)
 
-        output_items = signal_kill_restart(func_batcher)
+        with torch.no_grad():
+            output_items = signal_kill_restart_reduce_workers(
+                    func_batcher, self.batcher_eval)
         results_mkinds = self.nswrap.outputs_items_to_results(output_items)
 
         # Stats

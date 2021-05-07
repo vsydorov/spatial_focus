@@ -637,7 +637,7 @@ def get_explicit_model_i3d(nclass):
     freeze_batchnorm = False
     model = ResNet3D(Bottleneck3D, [3, 4, 6, 3])  # 50
     if pretrained:
-        from torchvision.models.resnet import resnet50
+        from torchvision.models.resnet import resnet50  # type: ignore
         model2d = resnet50(pretrained=True)
         model.load_2d(model2d)
     if replace_last_layer:
