@@ -299,6 +299,13 @@ def get_attention_loss(attention_kind, output_c, target_c):
     return loss
 
 
+def forward_hook_gcam(self, input_, output):
+    self.gcam_activation = output
+
+def backward_hook_gcam(self, grad_input, grad_output):
+    self.gcam_grad = grad_input[0]
+
+
 def get_attention_gradient_bs1(
         single_gpu_model, input_c, target_c,
         attention_loss_func):
@@ -308,6 +315,8 @@ def get_attention_gradient_bs1(
 
     assert len(input_c.shape) == 5
     assert len(target_c.shape) == 3
+
+    pass
 
     gradient = []
     for input0_c, target0_c in zip(input_c, target_c):
@@ -329,6 +338,47 @@ def get_attention_gradient_bs1(
     assert len(gradient.shape) == 5
 
     return gradient
+
+
+def get_attention_gradcam_bs1(
+        single_gpu_model, input_c, target_c,
+        attention_loss_func):
+
+    was_training = single_gpu_model.training
+    single_gpu_model.eval()
+
+    assert len(input_c.shape) == 5
+    assert len(target_c.shape) == 3
+
+    # import pudb; pudb.set_trace()  # XXX BREAKPOINT
+    fhook = single_gpu_model.basenet.layer4.register_forward_hook(forward_hook_gcam)
+    bhook = single_gpu_model.basenet.layer4.register_backward_hook(backward_hook_gcam)
+
+    heatmaps = []
+    for input0_c, target0_c in zip(input_c, target_c):
+        with torch.enable_grad():
+            input0_c_ = input0_c[None]
+            target0_c_ = target0_c[None]
+            output0_c = single_gpu_model(input0_c_, None)  # 1, 7, 157
+            loss0 = attention_loss_func(output0_c, target0_c_)
+        loss0.backward(retain_graph=False)
+        # GCAM logic
+        gcam_activ = single_gpu_model.basenet.layer4.gcam_activation.detach()
+        gcam_grad = single_gpu_model.basenet.layer4.gcam_grad
+        feature_weights = torch.mean(gcam_grad, dim=(2, 3, 4), keepdim=True)
+        weighed_activations = gcam_activ * feature_weights
+        # B, T, H_feat, W_feat
+        heatmap = torch.functional.F.relu(torch.sum(weighed_activations, dim=1))
+        heatmaps.append(heatmap)
+    heatmaps = torch.cat(heatmaps, dim=0)
+    if was_training:
+        single_gpu_model.train()
+
+    # Clean hook
+    fhook.remove()
+    bhook.remove()
+
+    return heatmaps
 
 
 def reduce_channel(gradient, kind):
@@ -497,18 +547,38 @@ class Networks_wrap(object):
         assert isinstance(self.model, MyDataParallel)
         single_gpu_model = self.model.module
 
-        def attention_loss_func(output_c, target_c):
-            return get_attention_loss(self.att_kind, output_c, target_c)
-        gradient = get_attention_gradient_bs1(
-                single_gpu_model, X_f32c,
-                target_cpu.cuda(), attention_loss_func)
+        if self.att_kind in ['hacky', 'entropy', 'cheating']:
+            def attention_loss_func(output_c, target_c):
+                return get_attention_loss(self.att_kind, output_c, target_c)
 
-        gradient = gradient.abs()
-        gradient = reduce_channel(gradient, self.channel_reduce)  # B,T,H,W,1
-        gradient = reduce_frame(
-                gradient, self.perframe_reduce, framedim=1)  # B,1,H,W,1
-        boxes = get_gradientsum_boxes(
-                gradient[:, 0], self.boxsum_conv, self.att_crop)
+            gradient = get_attention_gradient_bs1(
+                    single_gpu_model, X_f32c,
+                    target_cpu.cuda(), attention_loss_func)
+            gradient = gradient.abs()
+            gradient = reduce_channel(gradient, self.channel_reduce)  # B,T,H,W,1
+            gradient = reduce_frame(
+                    gradient, self.perframe_reduce, framedim=1)  # B,1,H,W,1
+            boxes = get_gradientsum_boxes(
+                    gradient[:, 0], self.boxsum_conv, self.att_crop)
+        elif self.att_kind in ['entropy_gradcam']:
+
+            def attention_loss_func(output_c, target_c):
+                return -1 * get_loss_entropy(output_c)
+
+            # B, T, H_conv, W_conv
+            heatmap = get_attention_gradcam_bs1(
+                    single_gpu_model, X_f32c,
+                    target_cpu.cuda(), attention_loss_func)
+            H, W = X_f32c.shape[2:4]
+            heatmap = F.interpolate(heatmap, (H, W), mode='bilinear')  # B, T, H, W
+            heatmap = torch.max(heatmap, dim=1, keepdim=True)[0]  # B, 1, H, W
+            heatmap = torch.unsqueeze(heatmap, dim=4)  # B,1,H,W,1
+            boxes = get_gradientsum_boxes(
+                    heatmap[:, 0], self.boxsum_conv, self.att_crop)
+            gradient = heatmap
+        else:
+            raise RuntimeError('Unknown attention kind')
+
         return gradient, boxes
 
 

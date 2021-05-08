@@ -96,7 +96,7 @@ torch_data:
 
 attention:
     crop: 128
-    kind: !def ['entropy', ['hacky', 'entropy', 'cheating']]
+    kind: !def ['entropy', ['hacky', 'entropy', 'cheating', 'entropy_gradcam']]
 
 twonet:
     original_net_kind: !def ['fixed_old', ['fixed_old', 'new']]
