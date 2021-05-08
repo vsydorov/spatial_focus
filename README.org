@@ -1,0 +1,5 @@
+* Focused Attention for Action Recognition 
+
+- Code for "Focused Attention for Action Recognition" paper
+	- https://hal.archives-ouvertes.fr/hal-02292339/
+- Proper documentation, reproducible experiments, trained models to appear soon

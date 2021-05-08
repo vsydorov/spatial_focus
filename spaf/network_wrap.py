@@ -303,7 +303,7 @@ def forward_hook_gcam(self, input_, output):
     self.gcam_activation = output
 
 def backward_hook_gcam(self, grad_input, grad_output):
-    self.gcam_grad = grad_input[0]
+    self.gcam_grad = grad_output[0]
 
 
 def get_attention_gradient_bs1(
@@ -352,7 +352,7 @@ def get_attention_gradcam_bs1(
 
     # import pudb; pudb.set_trace()  # XXX BREAKPOINT
     fhook = single_gpu_model.basenet.layer4.register_forward_hook(forward_hook_gcam)
-    bhook = single_gpu_model.basenet.layer4.register_backward_hook(backward_hook_gcam)
+    bhook = single_gpu_model.basenet.layer4.register_full_backward_hook(backward_hook_gcam)
 
     heatmaps = []
     for input0_c, target0_c in zip(input_c, target_c):
